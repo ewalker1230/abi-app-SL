@@ -11,6 +11,7 @@ from typing import List, Dict, Any
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import re
 
 # Load environment variables
 load_dotenv()
@@ -192,25 +193,223 @@ class CSVChatApp:
         if not self.dfs:
             return None
 
-        # Simple visualization logic based on query keywords
-        query_lower = query.lower()
+        # Parse the visualization intent
+        intent = self.parse_visualization_intent(query)
+        
+        if not intent['chart_type']:
+            return None
+            
+        # Generate the appropriate chart
+        try:
+            if intent['chart_type'] == 'bar':
+                return self.create_bar_chart(intent)
+            elif intent['chart_type'] == 'line':
+                return self.create_line_chart(intent)
+            elif intent['chart_type'] == 'scatter':
+                return self.create_scatter_chart(intent)
+            elif intent['chart_type'] == 'pie':
+                return self.create_pie_chart(intent)
+            elif intent['chart_type'] == 'histogram':
+                return self.create_histogram_chart(intent)
+            elif intent['chart_type'] == 'box':
+                return self.create_box_chart(intent)
+        except Exception as e:
+            st.error(f"Error creating chart: {str(e)}")
+            return None
 
-        if "chart" in query_lower or "graph" in query_lower or "plot" in query_lower:
-            # For now, use the first dataframe for visualization
-            # You could enhance this to work with multiple dataframes
-            first_df = list(self.dfs.values())[0]
-            numeric_cols = first_df.select_dtypes(include=['number']).columns
-
-            if len(numeric_cols) >= 2:
-                fig = px.scatter(first_df, x=numeric_cols[0], y=numeric_cols[1], 
-                               title=f"{numeric_cols[0]} vs {numeric_cols[1]}")
+    def create_bar_chart(self, intent):
+        """Create a bar chart based on parsed intent"""
+        if not intent['columns']:
+            return None
+            
+        # Get the first dataset and columns
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        # Handle grouping
+        if 'group_by' in intent['parameters']:
+            group_col = intent['parameters']['group_by']
+            # Find the actual column name that matches
+            group_col_actual = None
+            for col in df.columns:
+                if group_col in col.lower() or col.lower() in group_col:
+                    group_col_actual = col
+                    break
+            
+            if group_col_actual and intent['columns']:
+                value_col = intent['columns'][0]
+                # Aggregate if needed
+                if intent['parameters'].get('aggregation') == 'mean':
+                    data = df.groupby(group_col_actual)[value_col].mean().reset_index()
+                elif intent['parameters'].get('aggregation') == 'sum':
+                    data = df.groupby(group_col_actual)[value_col].sum().reset_index()
+                else:
+                    data = df.groupby(group_col_actual)[value_col].count().reset_index()
+                
+                fig = px.bar(data, x=group_col_actual, y=value_col,
+                           title=f"{value_col} by {group_col_actual}")
                 return fig
-            elif len(numeric_cols) == 1:
-                fig = px.histogram(first_df, x=numeric_cols[0], 
-                                 title=f"Distribution of {numeric_cols[0]}")
-                return fig
-
+        
+        # Simple bar chart of first column
+        if intent['columns']:
+            col = intent['columns'][0]
+            fig = px.bar(df, x=col, title=f"Distribution of {col}")
+            return fig
+        
         return None
+
+    def create_line_chart(self, intent):
+        """Create a line chart based on parsed intent"""
+        if not intent['columns']:
+            return None
+            
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        # Look for date columns for time series
+        date_cols = [col for col in df.columns if 'date' in col.lower()]
+        
+        if date_cols and intent['columns']:
+            date_col = date_cols[0]
+            value_col = intent['columns'][0]
+            
+            # Convert to datetime if needed
+            df_copy = df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col])
+            df_copy = df_copy.sort_values(date_col)
+            
+            fig = px.line(df_copy, x=date_col, y=value_col,
+                         title=f"{value_col} over time")
+            return fig
+        
+        return None
+
+    def create_scatter_chart(self, intent):
+        """Create a scatter plot based on parsed intent"""
+        if len(intent['columns']) < 2:
+            return None
+            
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        x_col = intent['columns'][0]
+        y_col = intent['columns'][1]
+        
+        fig = px.scatter(df, x=x_col, y=y_col,
+                        title=f"{y_col} vs {x_col}")
+        return fig
+
+    def create_pie_chart(self, intent):
+        """Create a pie chart based on parsed intent"""
+        if not intent['columns']:
+            return None
+            
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        col = intent['columns'][0]
+        
+        # Count values for pie chart
+        value_counts = df[col].value_counts()
+        
+        fig = px.pie(values=value_counts.values, names=value_counts.index,
+                    title=f"Distribution of {col}")
+        return fig
+
+    def create_histogram_chart(self, intent):
+        """Create a histogram based on parsed intent"""
+        if not intent['columns']:
+            return None
+            
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        col = intent['columns'][0]
+        
+        fig = px.histogram(df, x=col, title=f"Distribution of {col}")
+        return fig
+
+    def create_box_chart(self, intent):
+        """Create a box plot based on parsed intent"""
+        if not intent['columns']:
+            return None
+            
+        df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
+        df = self.dfs[df_name]
+        
+        col = intent['columns'][0]
+        
+        fig = px.box(df, y=col, title=f"Box plot of {col}")
+        return fig
+
+    def parse_visualization_intent(self, query: str):
+        query_lower = query.lower()
+        
+        # Step 1: Detect chart type
+        chart_type = self.detect_chart_type(query_lower)
+        
+        # Step 2: Extract columns and datasets
+        columns, datasets = self.extract_columns_and_datasets(query_lower)
+        
+        # Step 3: Extract additional parameters
+        params = self.extract_chart_parameters(query_lower)
+        
+        return {
+            'chart_type': chart_type,
+            'columns': columns,
+            'datasets': datasets,
+            'parameters': params
+        }
+
+    def detect_chart_type(self, query: str):
+        chart_patterns = {
+            'bar': ['bar', 'bars', 'bar chart', 'bar graph'],
+            'line': ['line', 'line chart', 'trend', 'over time', 'timeline'],
+            'scatter': ['scatter', 'scatter plot', 'correlation', 'relationship'],
+            'pie': ['pie', 'pie chart', 'proportion', 'percentage', 'share'],
+            'histogram': ['histogram', 'distribution', 'frequency'],
+            'box': ['box', 'box plot', 'boxplot', 'quartile']
+        }
+        
+        for chart_type, keywords in chart_patterns.items():
+            if any(keyword in query for keyword in keywords):
+                return chart_type
+        return None
+
+    def extract_columns_and_datasets(self, query: str):
+        columns = []
+        datasets = []
+        
+        # Check each dataset and its columns
+        for df_name, df in self.dfs.items():
+            for col in df.columns:
+                col_lower = col.lower().replace('_', ' ')
+                if col_lower in query or col in query:
+                    columns.append(col)
+                    datasets.append(df_name)
+        
+        return columns, datasets
+
+    def extract_chart_parameters(self, query: str):
+        params = {}
+        
+        # Extract aggregation functions
+        if 'average' in query or 'mean' in query:
+            params['aggregation'] = 'mean'
+        elif 'sum' in query:
+            params['aggregation'] = 'sum'
+        elif 'count' in query:
+            params['aggregation'] = 'count'
+        
+        # Extract grouping
+        if 'by' in query:
+            # Find what comes after "by"
+            by_index = query.find('by')
+            after_by = query[by_index:].split()[1] if len(query[by_index:].split()) > 1 else None
+            if after_by:
+                params['group_by'] = after_by
+        
+        return params
 
 def main():
     st.set_page_config(
@@ -336,7 +535,9 @@ def main():
                     # Generate visualization if appropriate
                     viz = app.generate_visualization(prompt)
                     if viz:
+                        st.subheader("📊 Generated Visualization")
                         st.plotly_chart(viz, use_container_width=True)
+                        st.caption(f"Chart type: {app.parse_visualization_intent(prompt)['chart_type']}")
 
             # Add assistant response to chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
