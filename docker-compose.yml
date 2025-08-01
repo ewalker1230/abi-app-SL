@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # PostgreSQL with pgvector
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: abi-postgres
+    environment:
+      POSTGRES_DB: csv_chat
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d csv_chat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - abi-network
+
+  # CSV Chat Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: abi-app
+    ports:
+      - "8501:8501"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=csv_chat
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_PORT=5432
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - abi-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  abi-network:
+    driver: bridge 

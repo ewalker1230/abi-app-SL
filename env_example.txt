@@ -1,0 +1,13 @@
+# OpenAI API Configuration
+OPENAI_API_KEY=your_openai_api_key_here
+
+# PostgreSQL Configuration (for vector storage)
+POSTGRES_HOST=localhost
+POSTGRES_DB=csv_chat
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=your_password_here
+POSTGRES_PORT=5432
+
+# Optional: ChromaDB Configuration (for alternative approach)
+# CHROMA_HOST=localhost
+# CHROMA_PORT=8000 
