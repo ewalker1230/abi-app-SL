@@ -20,7 +20,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class CSVChatApp:
     def __init__(self):
-        self.df = None
+        self.dfs = {}  # Dictionary to store multiple dataframes
         self.chroma_client = None
         self.collection = None
         self.chat_history = []
@@ -32,34 +32,37 @@ class CSVChatApp:
                 # Use persistent storage to avoid context leaks
                 self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
                 
-            # Try to get existing collection, create if it doesn't exist
+            # Delete existing collection if it exists (to avoid metadata format issues)
             try:
-                self.collection = self.chroma_client.get_collection(name="csv_data")
+                self.chroma_client.delete_collection(name="csv_data")
             except:
-                self.collection = self.chroma_client.create_collection(
-                    name="csv_data",
-                    metadata={"description": "CSV data for semantic search"}
-                )
+                pass  # Collection doesn't exist, which is fine
+                
+            # Create new collection
+            self.collection = self.chroma_client.create_collection(
+                name="csv_data",
+                metadata={"description": "CSV data for semantic search"}
+            )
         except Exception as e:
             st.error(f"Error setting up ChromaDB: {str(e)}")
             self.chroma_client = None
             self.collection = None
 
-    def process_csv(self, uploaded_file) -> pd.DataFrame:
+    def process_csv(self, uploaded_file, filename: str) -> pd.DataFrame:
         """Process uploaded CSV file"""
         try:
             df = pd.read_csv(uploaded_file)
-            self.df = df
+            self.dfs[filename] = df
             self.setup_chroma()
-            self.index_data()
+            self.index_data(filename, df)
             return df
         except Exception as e:
             st.error(f"Error processing CSV: {str(e)}")
             return None
 
-    def index_data(self):
+    def index_data(self, filename: str, df: pd.DataFrame):
         """Index CSV data for semantic search"""
-        if self.df is None:
+        if df is None:
             return
 
         if self.collection is None:
@@ -72,12 +75,12 @@ class CSVChatApp:
             metadatas = []
             ids = []
 
-            for idx, row in self.df.iterrows():
+            for idx, row in df.iterrows():
                 # Create a text representation of the row
                 row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
                 documents.append(row_text)
-                metadatas.append({"row_index": idx})
-                ids.append(f"row_{idx}")
+                metadatas.append({"row_index": idx, "filename": filename})
+                ids.append(f"{filename}_row_{idx}")
 
             # Add to ChromaDB
             self.collection.add(
@@ -85,51 +88,91 @@ class CSVChatApp:
                 metadatas=metadatas,
                 ids=ids
             )
-            st.success(f"Indexed {len(documents)} rows in ChromaDB")
+            st.success(f"Indexed {len(documents)} rows from {filename} in ChromaDB")
         except Exception as e:
-            st.error(f"Error indexing data: {str(e)}")
+            st.error(f"Error indexing data from {filename}: {str(e)}")
 
     def query_data(self, user_query: str) -> str:
         """Query the data using OpenAI and ChromaDB"""
-        if self.df is None:
-            return "Please upload a CSV file first."
+        if not self.dfs:
+            return "Please upload at least one CSV file first."
 
         if self.collection is None:
+            st.error("ChromaDB collection is None. Please try uploading your CSV files again.")
             return "Please upload a CSV file first to initialize the search index."
 
         try:
+            # Calculate total rows across all dataframes
+            total_rows = sum(len(df) for df in self.dfs.values())
+            
+            # Check if collection has any data
+            collection_count = self.collection.count()
+            if collection_count == 0:
+                return "No data has been indexed yet. Please make sure your CSV files were processed successfully."
+            
             # Search for relevant data
             results = self.collection.query(
                 query_texts=[user_query],
-                n_results=min(10, len(self.df))
+                n_results=min(10, total_rows)
             )
 
-            # Get relevant rows
+            # Get relevant rows from all dataframes
             relevant_rows = []
-            if results['metadatas'] and results['metadatas'][0]:
+            if results and 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
                 for metadata in results['metadatas'][0]:
-                    row_idx = metadata['row_index']
-                    relevant_rows.append(self.df.iloc[row_idx])
+                    if metadata and 'row_index' in metadata and 'filename' in metadata:
+                        row_idx = metadata['row_index']
+                        filename = metadata['filename']
+                        if filename in self.dfs:
+                            try:
+                                relevant_rows.append({
+                                    'filename': filename,
+                                    'data': self.dfs[filename].iloc[row_idx]
+                                })
+                            except Exception as row_error:
+                                st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
+                                continue
         except Exception as e:
+            st.error(f"Error searching data: {str(e)}")
             return f"Error searching data: {str(e)}"
 
         # Create context for OpenAI
-        context = f"""
-        CSV Data Schema:
-        Columns: {list(self.df.columns)}
-        Total Rows: {len(self.df)}
+        context_parts = []
         
-        Sample Data (first 5 rows):
-        {self.df.head().to_string()}
+        # Add information about all loaded datasets
+        for filename, df in self.dfs.items():
+            context_parts.append(f"""
+            Dataset: {filename}
+            Columns: {list(df.columns)}
+            Total Rows: {len(df)}
+            Sample Data (first 3 rows):
+            {df.head(3).to_string()}
+            """)
+        
+        # Add relevant data found
+        if relevant_rows:
+            relevant_data_parts = []
+            for item in relevant_rows:
+                relevant_data_parts.append(f"""
+                From {item['filename']}:
+                {item['data'].to_string()}
+                """)
+            relevant_data_text = "\n".join(relevant_data_parts)
+        else:
+            relevant_data_text = "No relevant data found"
+        
+        context = f"""
+        Available Datasets:
+        {chr(10).join(context_parts)}
         
         Relevant Data for Query:
-        {pd.DataFrame(relevant_rows).to_string() if relevant_rows else "No relevant data found"}
+        {relevant_data_text}
         
         User Query: {user_query}
         
         Please provide a helpful response based on this data. If the query asks for analysis, 
         provide insights. If it asks for specific data, provide the relevant information.
-        Be conversational and helpful.
+        Be conversational and helpful. When referencing data, mention which dataset it comes from.
         """
 
         try:
@@ -146,22 +189,24 @@ class CSVChatApp:
 
     def generate_visualization(self, query: str):
         """Generate visualizations based on user query"""
-        if self.df is None:
+        if not self.dfs:
             return None
 
         # Simple visualization logic based on query keywords
         query_lower = query.lower()
 
         if "chart" in query_lower or "graph" in query_lower or "plot" in query_lower:
-            # Try to create a basic chart
-            numeric_cols = self.df.select_dtypes(include=['number']).columns
+            # For now, use the first dataframe for visualization
+            # You could enhance this to work with multiple dataframes
+            first_df = list(self.dfs.values())[0]
+            numeric_cols = first_df.select_dtypes(include=['number']).columns
 
             if len(numeric_cols) >= 2:
-                fig = px.scatter(self.df, x=numeric_cols[0], y=numeric_cols[1], 
+                fig = px.scatter(first_df, x=numeric_cols[0], y=numeric_cols[1], 
                                title=f"{numeric_cols[0]} vs {numeric_cols[1]}")
                 return fig
             elif len(numeric_cols) == 1:
-                fig = px.histogram(self.df, x=numeric_cols[0], 
+                fig = px.histogram(first_df, x=numeric_cols[0], 
                                  title=f"Distribution of {numeric_cols[0]}")
                 return fig
 
@@ -186,20 +231,66 @@ def main():
     # Sidebar for file upload
     with st.sidebar:
         st.header("📁 Upload Data")
-        uploaded_file = st.file_uploader(
-            "Choose a CSV file",
+        uploaded_files = st.file_uploader(
+            "Choose CSV files",
             type=['csv'],
-            help="Upload your CSV file to start chatting with it"
+            accept_multiple_files=True,
+            help="Upload one or more CSV files to start chatting with them"
         )
 
-        if uploaded_file is not None:
-            if app.df is None or st.button("Reload Data"):
-                with st.spinner("Processing CSV..."):
-                    df = app.process_csv(uploaded_file)
-                    if df is not None:
-                        st.success("CSV processed successfully!")
-                        st.write(f"**Shape:** {df.shape}")
-                        st.write(f"**Columns:** {list(df.columns)}")
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                if uploaded_file.name not in app.dfs or st.button(f"Reload {uploaded_file.name}"):
+                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                        df = app.process_csv(uploaded_file, uploaded_file.name)
+                        if df is not None:
+                            st.success(f"{uploaded_file.name} processed successfully!")
+                            st.write(f"**Shape:** {df.shape}")
+                            st.write(f"**Columns:** {list(df.columns)}")
+        
+        # Show loaded datasets
+        if app.dfs:
+            st.header("📊 Loaded Datasets")
+            
+            # Add button to re-index all data
+            if st.button("🔄 Re-index All Data"):
+                with st.spinner("Re-indexing all data..."):
+                    app.setup_chroma()  # This will clear and recreate the collection
+                    for filename, df in app.dfs.items():
+                        app.index_data(filename, df)
+                st.success("All data re-indexed successfully!")
+            
+            # Add button to clear all data
+            if st.button("🗑️ Clear All Data"):
+                app.dfs.clear()
+                app.setup_chroma()  # This will clear the ChromaDB collection
+                st.success("All data cleared!")
+                st.rerun()
+            
+            for filename, df in app.dfs.items():
+                with st.expander(f"{filename} ({len(df)} rows)"):
+                    st.dataframe(df.head(5))
+                    st.write(f"**Columns:** {list(df.columns)}")
+                    
+                    # Add remove button for individual datasets
+                    if st.button(f"❌ Remove {filename}", key=f"remove_{filename}"):
+                        # Remove from memory
+                        del app.dfs[filename]
+                        
+                        # Remove from ChromaDB
+                        if app.collection:
+                            try:
+                                # Get all IDs for this filename
+                                results = app.collection.get(
+                                    where={"filename": filename}
+                                )
+                                if results['ids']:
+                                    app.collection.delete(ids=results['ids'])
+                                    st.success(f"Removed {filename} from database")
+                            except Exception as e:
+                                st.error(f"Error removing from database: {str(e)}")
+                        
+                        st.rerun()
 
         # Configuration info
         st.header("🔑 Configuration")
@@ -210,12 +301,15 @@ def main():
             st.info("Please add OPENAI_API_KEY to your .env file")
 
     # Main chat interface
-    if app.df is not None:
+    if app.dfs:
         st.header("💬 Chat with Your Data")
 
         # Display data preview
         with st.expander("📋 Data Preview"):
-            st.dataframe(app.df.head(10))
+            for filename, df in app.dfs.items():
+                st.subheader(f"📄 {filename}")
+                st.dataframe(df.head(5))
+                st.write("---")
 
         # Chat interface
         if "messages" not in st.session_state:

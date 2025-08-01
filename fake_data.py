@@ -8,7 +8,7 @@ fake = Faker()
 # Set a seed for reproducibility (optional)
 Faker.seed(42)
 
-def generate_fake_ad_campaign_data(num_campaigns=100):
+def generate_fake_ad_campaign_data(num_campaigns=28):
     """Generates a list of dictionaries representing fake ad campaign data."""
     ad_campaign_data = []
     ad_platforms = ["Facebook", "Google Ads", "Instagram", "LinkedIn", "Twitter", "TikTok", "YouTube", "Snapchat"]
@@ -65,14 +65,14 @@ def generate_fake_ad_campaign_data(num_campaigns=100):
         ad_campaign_data.append(ad_campaign)
     return ad_campaign_data
 
-# Generate 100 fake ad campaigns
-fake_ad_campaigns = generate_fake_ad_campaign_data(num_campaigns=100)
+# Generate 20 fake ad campaigns
+fake_ad_campaigns_shorter = generate_fake_ad_campaign_data(num_campaigns=20)
 
 # Convert to a Pandas DataFrame for easier analysis and storage
-df_ad_campaigns = pd.DataFrame(fake_ad_campaigns)
+df_ad_campaigns = pd.DataFrame(fake_ad_campaigns_shorter)
 
 # Save to CSV file
-df_ad_campaigns.to_csv("fake_ad_campaigns.csv", index=False)
+df_ad_campaigns.to_csv("fake_ad_campaigns_20.csv", index=False)
 print("Generated fake ad campaign data with", len(df_ad_campaigns), "campaigns")
 print("Columns:", list(df_ad_campaigns.columns))
 print("\nFirst few rows:")
