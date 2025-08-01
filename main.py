@@ -27,12 +27,23 @@ class CSVChatApp:
 
     def setup_chroma(self):
         """Initialize ChromaDB for vector storage"""
-        if self.chroma_client is None:
-            self.chroma_client = chromadb.Client()
-            self.collection = self.chroma_client.create_collection(
-                name="csv_data",
-                metadata={"description": "CSV data for semantic search"}
-            )
+        try:
+            if self.chroma_client is None:
+                # Use persistent storage to avoid context leaks
+                self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+                
+            # Try to get existing collection, create if it doesn't exist
+            try:
+                self.collection = self.chroma_client.get_collection(name="csv_data")
+            except:
+                self.collection = self.chroma_client.create_collection(
+                    name="csv_data",
+                    metadata={"description": "CSV data for semantic search"}
+                )
+        except Exception as e:
+            st.error(f"Error setting up ChromaDB: {str(e)}")
+            self.chroma_client = None
+            self.collection = None
 
     def process_csv(self, uploaded_file) -> pd.DataFrame:
         """Process uploaded CSV file"""
@@ -51,24 +62,32 @@ class CSVChatApp:
         if self.df is None:
             return
 
-        # Create text representations of each row
-        documents = []
-        metadatas = []
-        ids = []
+        if self.collection is None:
+            st.error("ChromaDB collection not initialized")
+            return
 
-        for idx, row in self.df.iterrows():
-            # Create a text representation of the row
-            row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
-            documents.append(row_text)
-            metadatas.append({"row_index": idx})
-            ids.append(f"row_{idx}")
+        try:
+            # Create text representations of each row
+            documents = []
+            metadatas = []
+            ids = []
 
-        # Add to ChromaDB
-        self.collection.add(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
-        )
+            for idx, row in self.df.iterrows():
+                # Create a text representation of the row
+                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                documents.append(row_text)
+                metadatas.append({"row_index": idx})
+                ids.append(f"row_{idx}")
+
+            # Add to ChromaDB
+            self.collection.add(
+                documents=documents,
+                metadatas=metadatas,
+                ids=ids
+            )
+            st.success(f"Indexed {len(documents)} rows in ChromaDB")
+        except Exception as e:
+            st.error(f"Error indexing data: {str(e)}")
 
     def query_data(self, user_query: str) -> str:
         """Query the data using OpenAI and ChromaDB"""
