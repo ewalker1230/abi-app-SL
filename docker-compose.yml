@@ -21,6 +21,18 @@ services:
     networks:
       - abi-network
 
+  # Redis for conversation memory
+  redis:
+    image: redis:7-alpine
+    container_name: abi-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - abi-network
+    restart: unless-stopped
+
   # CSV Chat Application
   app:
     build:
@@ -35,16 +47,23 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=password
       - POSTGRES_PORT=5432
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./chroma_db:/app/chroma_db
     networks:
       - abi-network
     restart: unless-stopped
 
 volumes:
   postgres_data:
+  redis_data:
 
 networks:
   abi-network:
