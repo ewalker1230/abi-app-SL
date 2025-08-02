@@ -23,6 +23,7 @@ class CSVChatApp:
     def __init__(self):
         self.dfs = {}  # Dictionary to store multiple dataframes
         self.text_files = set()  # Set to track uploaded text files
+        self.text_contents = {}  # Dictionary to store original text content
         self.chroma_client = None
         self.collection = None
         self.chat_history = []
@@ -67,6 +68,9 @@ class CSVChatApp:
         try:
             # Read the text content
             text_content = uploaded_file.read().decode('utf-8')
+            
+            # Store original content for preview
+            self.text_contents[filename] = text_content
             
             # Setup ChromaDB if not already done
             self.setup_chroma()
@@ -172,43 +176,63 @@ class CSVChatApp:
 
     def query_data(self, user_query: str) -> str:
         """Query the data using OpenAI and ChromaDB"""
-        if not self.dfs:
-            return "Please upload at least one CSV file first."
+        if not self.dfs and not self.text_files:
+            return "Please upload at least one CSV file or text document first."
 
         if self.collection is None:
-            st.error("ChromaDB collection is None. Please try uploading your CSV files again.")
-            return "Please upload a CSV file first to initialize the search index."
+            st.error("ChromaDB collection is None. Please try uploading your files again.")
+            return "Please upload a CSV file or text document first to initialize the search index."
 
         try:
-            # Calculate total rows across all dataframes
-            total_rows = sum(len(df) for df in self.dfs.values())
-            
             # Check if collection has any data
             collection_count = self.collection.count()
             if collection_count == 0:
-                return "No data has been indexed yet. Please make sure your CSV files were processed successfully."
+                return "No data has been indexed yet. Please make sure your files were processed successfully."
+            
+            # Calculate total items (CSV rows + text chunks)
+            total_csv_rows = sum(len(df) for df in self.dfs.values())
+            total_items = max(collection_count, total_csv_rows, 1)  # Ensure at least 1
             
             # Search for relevant data
             results = self.collection.query(
                 query_texts=[user_query],
-                n_results=min(10, total_rows)
+                n_results=min(10, total_items)
             )
 
-            # Get relevant rows from all dataframes
-            relevant_rows = []
+            # Get relevant data from all sources
+            relevant_data = []
             if results and 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
-                for metadata in results['metadatas'][0]:
-                    if metadata and 'row_index' in metadata and 'filename' in metadata:
-                        row_idx = metadata['row_index']
+                for i, metadata in enumerate(results['metadatas'][0]):
+                    if metadata and 'filename' in metadata:
                         filename = metadata['filename']
-                        if filename in self.dfs:
+                        
+                        # Handle CSV data
+                        if 'row_index' in metadata and filename in self.dfs:
                             try:
-                                relevant_rows.append({
+                                row_idx = metadata['row_index']
+                                relevant_data.append({
                                     'filename': filename,
+                                    'type': 'csv_row',
                                     'data': self.dfs[filename].iloc[row_idx]
                                 })
                             except Exception as row_error:
                                 st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
+                                continue
+                        
+                        # Handle text data
+                        elif 'content_type' in metadata and metadata['content_type'] == 'text':
+                            try:
+                                # Get the actual text content from results
+                                if 'documents' in results and results['documents'] and i < len(results['documents'][0]):
+                                    text_content = results['documents'][0][i]
+                                    relevant_data.append({
+                                        'filename': filename,
+                                        'type': 'text_chunk',
+                                        'data': text_content,
+                                        'chunk_index': metadata.get('chunk_index', 'unknown')
+                                    })
+                            except Exception as text_error:
+                                st.warning(f"Error accessing text chunk from {filename}: {str(text_error)}")
                                 continue
         except Exception as e:
             st.error(f"Error searching data: {str(e)}")
@@ -221,19 +245,34 @@ class CSVChatApp:
         for filename, df in self.dfs.items():
             context_parts.append(f"""
             Dataset: {filename}
+            Type: CSV
             Columns: {list(df.columns)}
             Total Rows: {len(df)}
             Sample Data (first 3 rows):
             {df.head(3).to_string()}
             """)
         
+        # Add information about text files
+        for filename in self.text_files:
+            context_parts.append(f"""
+            Document: {filename}
+            Type: Text Document
+            Status: Indexed in vector database
+            """)
+        
         # Add relevant data found
-        if relevant_rows:
+        if relevant_data:
             relevant_data_parts = []
-            for item in relevant_rows:
-                relevant_data_parts.append(f"""
-                From {item['filename']}:
+            for item in relevant_data:
+                if item['type'] == 'csv_row':
+                    relevant_data_parts.append(f"""
+                From CSV file {item['filename']}:
                 {item['data'].to_string()}
+                """)
+                elif item['type'] == 'text_chunk':
+                    relevant_data_parts.append(f"""
+                From text document {item['filename']} (chunk {item['chunk_index']}):
+                {item['data']}
                 """)
             relevant_data_text = "\n".join(relevant_data_parts)
         else:
@@ -256,7 +295,7 @@ class CSVChatApp:
         try:
             response = client.chat.completions.create(model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful data analyst assistant. You help users understand and analyze CSV data."},
+                {"role": "system", "content": "You are a helpful data analyst assistant. You help users understand and analyze CSV data and text documents."},
                 {"role": "user", "content": context}
             ],
             max_tokens=500,
@@ -561,6 +600,7 @@ def main():
             if st.button("🗑️ Clear All Data"):
                 app.dfs.clear()
                 app.text_files.clear()
+                app.text_contents.clear()
                 app.setup_chroma()  # This will clear the ChromaDB collection
                 st.success("All data cleared!")
                 st.rerun()
@@ -568,7 +608,7 @@ def main():
             # Show CSV datasets
             for filename, df in app.dfs.items():
                 with st.expander(f"📊 {filename} ({len(df)} rows)"):
-                    st.dataframe(df.head(5))
+                    st.dataframe(df.head(10))
                     st.write(f"**Columns:** {list(df.columns)}")
                     
                     # Add remove button for individual datasets
@@ -597,10 +637,37 @@ def main():
                     st.write(f"**Type:** Text Document")
                     st.write(f"**Status:** Indexed in vector database")
                     
+                    # Show text preview
+                    if filename in app.text_contents:
+                        text_content = app.text_contents[filename]
+                        # Count chunks (approximate)
+                        chunk_count = len(text_content) // 1000 + 1
+                        st.write(f"**Chunks:** {chunk_count} chunks indexed")
+                        
+                        # Show preview (first 500 characters)
+                        preview_length = 500
+                        preview_text = text_content[:preview_length]
+                        if len(text_content) > preview_length:
+                            preview_text += "..."
+                        
+                        st.write("**Preview:**")
+                        st.text_area("", value=preview_text, height=150, disabled=True, key=f"preview_{filename}")
+                        
+                        # Show full document button
+                        if st.button(f"📖 View Full Document", key=f"view_full_{filename}"):
+                            st.session_state[f"show_full_{filename}"] = not st.session_state.get(f"show_full_{filename}", False)
+                        
+                        # Show full document if requested
+                        if st.session_state.get(f"show_full_{filename}", False):
+                            st.write("**Full Document:**")
+                            st.text_area("", value=text_content, height=300, disabled=True, key=f"full_{filename}")
+                    
                     # Add remove button for text files
                     if st.button(f"❌ Remove {filename}", key=f"remove_text_{filename}"):
                         # Remove from tracking
                         app.text_files.remove(filename)
+                        if filename in app.text_contents:
+                            del app.text_contents[filename]
                         
                         # Remove from ChromaDB
                         if app.collection:
@@ -633,7 +700,7 @@ def main():
         with st.expander("📋 Data Preview"):
             for filename, df in app.dfs.items():
                 st.subheader(f"📄 {filename}")
-                st.dataframe(df.head(5))
+                st.dataframe(df.head(10))
                 st.write("---")
 
         # Chat interface
