@@ -430,6 +430,9 @@ def main():
     # Sidebar for file upload
     with st.sidebar:
         st.header("📁 Upload Data")
+        
+        # CSV file upload
+        st.subheader("📊 CSV Files")
         uploaded_files = st.file_uploader(
             "Choose CSV files",
             type=['csv'],
@@ -446,6 +449,20 @@ def main():
                             st.success(f"{uploaded_file.name} processed successfully!")
                             st.write(f"**Shape:** {df.shape}")
                             st.write(f"**Columns:** {list(df.columns)}")
+        
+        # Text file upload
+        st.subheader("📄 Text Files")
+        uploaded_text_files = st.file_uploader(
+            "Choose text files",
+            type=['txt'],
+            accept_multiple_files=True,
+            help="Upload one or more text files to add to the knowledge base"
+        )
+        
+        if uploaded_text_files:
+            for uploaded_file in uploaded_text_files:
+                st.info(f"Text file '{uploaded_file.name}' uploaded! Processing will be added in the next step.")
+                # We'll add the processing logic in the next step
         
         # Show loaded datasets
         if app.dfs:
