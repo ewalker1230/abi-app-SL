@@ -22,6 +22,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 class CSVChatApp:
     def __init__(self):
         self.dfs = {}  # Dictionary to store multiple dataframes
+        self.text_files = set()  # Set to track uploaded text files
         self.chroma_client = None
         self.collection = None
         self.chat_history = []
@@ -60,6 +61,82 @@ class CSVChatApp:
         except Exception as e:
             st.error(f"Error processing CSV: {str(e)}")
             return None
+
+    def process_text_file(self, uploaded_file, filename: str) -> bool:
+        """Process uploaded text file and add to vector database"""
+        try:
+            # Read the text content
+            text_content = uploaded_file.read().decode('utf-8')
+            
+            # Setup ChromaDB if not already done
+            self.setup_chroma()
+            
+            # Index the text content
+            self.index_text_data(filename, text_content)
+            
+            # Track the uploaded text file
+            self.text_files.add(filename)
+            
+            return True
+        except Exception as e:
+            st.error(f"Error processing text file {filename}: {str(e)}")
+            return False
+
+    def index_text_data(self, filename: str, text_content: str):
+        """Index text data for semantic search"""
+        if self.collection is None:
+            st.error("ChromaDB collection not initialized")
+            return
+
+        try:
+            # Split text into chunks (simple approach - can be improved)
+            chunk_size = 1000  # characters per chunk
+            overlap = 200  # characters overlap between chunks
+            
+            chunks = []
+            start = 0
+            
+            while start < len(text_content):
+                end = start + chunk_size
+                chunk = text_content[start:end]
+                chunks.append(chunk)
+                start = end - overlap
+                
+                # Don't go beyond the end
+                if start >= len(text_content):
+                    break
+
+            # Create documents and metadata for each chunk
+            documents = []
+            metadatas = []
+            ids = []
+
+            for idx, chunk in enumerate(chunks):
+                # Clean the chunk (remove extra whitespace)
+                clean_chunk = ' '.join(chunk.split())
+                if len(clean_chunk.strip()) > 50:  # Only add chunks with meaningful content
+                    documents.append(clean_chunk)
+                    metadatas.append({
+                        "chunk_index": idx,
+                        "filename": filename,
+                        "content_type": "text",
+                        "total_chunks": len(chunks)
+                    })
+                    ids.append(f"{filename}_text_chunk_{idx}")
+
+            # Add to ChromaDB
+            if documents:
+                self.collection.add(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+                st.success(f"Indexed {len(documents)} text chunks from {filename} in ChromaDB")
+            else:
+                st.warning(f"No meaningful content found in {filename}")
+
+        except Exception as e:
+            st.error(f"Error indexing text data from {filename}: {str(e)}")
 
     def index_data(self, filename: str, df: pd.DataFrame):
         """Index CSV data for semantic search"""
@@ -418,8 +495,8 @@ def main():
         layout="wide"
     )
 
-    st.title("ABI - Automated Business Intelligence")
-    st.markdown("Upload a CSV file and chat with your data in natural language!")
+    st.title("ABI - Agentic Business Intelligence")
+    st.markdown("Upload CSV files and text documents to chat with your data in natural language!")
 
     # Initialize app
     if 'app' not in st.session_state:
@@ -461,11 +538,15 @@ def main():
         
         if uploaded_text_files:
             for uploaded_file in uploaded_text_files:
-                st.info(f"Text file '{uploaded_file.name}' uploaded! Processing will be added in the next step.")
-                # We'll add the processing logic in the next step
+                with st.spinner(f"Processing text file {uploaded_file.name}..."):
+                    success = app.process_text_file(uploaded_file, uploaded_file.name)
+                    if success:
+                        st.success(f"Text file '{uploaded_file.name}' processed and added to vector database!")
+                    else:
+                        st.error(f"Failed to process text file '{uploaded_file.name}'")
         
         # Show loaded datasets
-        if app.dfs:
+        if app.dfs or app.text_files:
             st.header("📊 Loaded Datasets")
             
             # Add button to re-index all data
@@ -479,19 +560,47 @@ def main():
             # Add button to clear all data
             if st.button("🗑️ Clear All Data"):
                 app.dfs.clear()
+                app.text_files.clear()
                 app.setup_chroma()  # This will clear the ChromaDB collection
                 st.success("All data cleared!")
                 st.rerun()
             
+            # Show CSV datasets
             for filename, df in app.dfs.items():
-                with st.expander(f"{filename} ({len(df)} rows)"):
+                with st.expander(f"📊 {filename} ({len(df)} rows)"):
                     st.dataframe(df.head(5))
                     st.write(f"**Columns:** {list(df.columns)}")
                     
                     # Add remove button for individual datasets
-                    if st.button(f"❌ Remove {filename}", key=f"remove_{filename}"):
+                    if st.button(f"❌ Remove {filename}", key=f"remove_csv_{filename}"):
                         # Remove from memory
                         del app.dfs[filename]
+                        
+                        # Remove from ChromaDB
+                        if app.collection:
+                            try:
+                                # Get all IDs for this filename
+                                results = app.collection.get(
+                                    where={"filename": filename}
+                                )
+                                if results['ids']:
+                                    app.collection.delete(ids=results['ids'])
+                                    st.success(f"Removed {filename} from database")
+                            except Exception as e:
+                                st.error(f"Error removing from database: {str(e)}")
+                        
+                        st.rerun()
+            
+            # Show text files
+            for filename in app.text_files:
+                with st.expander(f"📄 {filename}"):
+                    st.write(f"**Type:** Text Document")
+                    st.write(f"**Status:** Indexed in vector database")
+                    
+                    # Add remove button for text files
+                    if st.button(f"❌ Remove {filename}", key=f"remove_text_{filename}"):
+                        # Remove from tracking
+                        app.text_files.remove(filename)
                         
                         # Remove from ChromaDB
                         if app.collection:
@@ -517,7 +626,7 @@ def main():
             st.info("Please add OPENAI_API_KEY to your .env file")
 
     # Main chat interface
-    if app.dfs:
+    if app.dfs or app.text_files:
         st.header("💬 Chat with Your Data")
 
         # Display data preview
