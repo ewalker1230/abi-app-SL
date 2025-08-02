@@ -548,7 +548,7 @@ def main():
         st.header("📁 Upload Data")
         
         # CSV file upload
-        st.subheader("📊 CSV Files")
+        #st.subheader("📊 CSV Files")
         uploaded_files = st.file_uploader(
             "Choose CSV files",
             type=['csv'],
@@ -567,7 +567,7 @@ def main():
                             st.write(f"**Columns:** {list(df.columns)}")
         
         # Text file upload
-        st.subheader("📄 Text Files")
+        #st.subheader("📄 Text Files")
         uploaded_text_files = st.file_uploader(
             "Choose text files",
             type=['txt'],
@@ -659,8 +659,15 @@ def main():
                         
                         # Show full document if requested
                         if st.session_state.get(f"show_full_{filename}", False):
-                            st.write("**Full Document:**")
-                            st.text_area("", value=text_content, height=300, disabled=True, key=f"full_{filename}")
+                            st.markdown("---")
+                            st.markdown("### 📖 Full Document Content")
+                            st.text_area("", value=text_content, height=400, disabled=True, key=f"full_{filename}")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write(f"**Document Length:** {len(text_content)} characters")
+                            with col2:
+                                st.write(f"**Estimated Chunks:** {len(text_content) // 1000 + 1}")
+                            st.markdown("---")
                     
                     # Add remove button for text files
                     if st.button(f"❌ Remove {filename}", key=f"remove_text_{filename}"):
@@ -698,9 +705,25 @@ def main():
 
         # Display data preview
         with st.expander("📋 Data Preview"):
+            # Show CSV datasets
             for filename, df in app.dfs.items():
-                st.subheader(f"📄 {filename}")
+                st.subheader(f"📊 {filename}")
                 st.dataframe(df.head(10))
+                st.write("---")
+            
+            # Show text documents
+            for filename in app.text_files:
+                st.subheader(f"📄 {filename}")
+                if filename in app.text_contents:
+                    text_content = app.text_contents[filename]
+                    # Show preview (first 1000 characters)
+                    preview_length = 1000
+                    preview_text = text_content[:preview_length]
+                    if len(text_content) > preview_length:
+                        preview_text += "..."
+                    
+                    st.text(preview_text)
+                    st.write(f"**Document Length:** {len(text_content)} characters | **Chunks:** {len(text_content) // 1000 + 1}")
                 st.write("---")
 
         # Chat interface
