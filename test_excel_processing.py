@@ -113,6 +113,51 @@ def process_excel_file(file_path):
         print(f"❌ Error processing Excel file: {str(e)}")
         return None
 
+def save_processed_data(df, original_file_path):
+    """Save the processed combined data to the data folder"""
+    if df is None:
+        return None
+    
+    try:
+        # Create output filename based on original file
+        original_filename = os.path.basename(original_file_path)
+        name_without_ext = os.path.splitext(original_filename)[0]
+        output_filename = f"processed_{name_without_ext}.csv"
+        output_path = os.path.join('data', output_filename)
+        
+        # Save as CSV (easier to work with than Excel for combined data)
+        df.to_csv(output_path, index=False)
+        print(f"\n💾 Saved processed data to: {output_path}")
+        print(f"   📊 Total rows: {len(df)}")
+        print(f"   📋 Total columns: {len(df.columns)}")
+        
+        # Also save as Excel with multiple sheets (one per original sheet)
+        excel_output_filename = f"processed_{name_without_ext}.xlsx"
+        excel_output_path = os.path.join('data', excel_output_filename)
+        
+        with pd.ExcelWriter(excel_output_path, engine='openpyxl') as writer:
+            # Save combined data to first sheet
+            df.to_excel(writer, sheet_name='Combined_Data', index=False)
+            
+            # Save individual sheets
+            if '_sheet_name' in df.columns:
+                for sheet_name in df['_sheet_name'].unique():
+                    sheet_data = df[df['_sheet_name'] == sheet_name].copy()
+                    # Remove the _sheet_name column for individual sheets
+                    sheet_data = sheet_data.drop('_sheet_name', axis=1)
+                    # Clean sheet name for Excel (remove invalid characters)
+                    clean_sheet_name = "".join(c for c in sheet_name if c.isalnum() or c in (' ', '-', '_'))[:31]
+                    sheet_data.to_excel(writer, sheet_name=clean_sheet_name, index=False)
+        
+        print(f"💾 Saved processed Excel file to: {excel_output_path}")
+        print(f"   📊 Combined sheet + {len(df['_sheet_name'].unique())} individual sheets")
+        
+        return output_path, excel_output_path
+        
+    except Exception as e:
+        print(f"❌ Error saving processed data: {str(e)}")
+        return None
+
 def test_data_analysis(df):
     """Test basic data analysis on the combined dataset"""
     if df is None:
@@ -167,6 +212,9 @@ def main():
             print(f"📁 Using real Excel file: {real_file_path}")
             combined_df = process_excel_file(real_file_path)
             test_data_analysis(combined_df)
+            
+            # Save the processed data
+            save_processed_data(combined_df, real_file_path)
         else:
             print(f"❌ File not found: {real_file_path}")
             print("🔍 Available files in data/ directory:")
@@ -186,12 +234,18 @@ def main():
             print(f"📁 Using default Excel file: {default_file_path}")
             combined_df = process_excel_file(default_file_path)
             test_data_analysis(combined_df)
+            
+            # Save the processed data
+            save_processed_data(combined_df, default_file_path)
         else:
             # Create test file if no real file found
             print("📊 No real file found, creating test data...")
             test_file = create_test_excel_file()
             combined_df = process_excel_file(test_file)
             test_data_analysis(combined_df)
+            
+            # Save the processed test data
+            save_processed_data(combined_df, test_file)
             
             # Cleanup test file only
             if os.path.exists(test_file):

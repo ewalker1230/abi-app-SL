@@ -27,6 +27,7 @@ class CSVChatApp:
         self.chroma_client = None
         self.collection = None
         self.chat_history = []
+        self.processed_files = set()  # Set to track processed file names
 
     def setup_chroma(self):
         """Initialize ChromaDB for vector storage"""
@@ -56,6 +57,7 @@ class CSVChatApp:
         try:
             df = pd.read_csv(uploaded_file)
             self.dfs[filename] = df
+            self.processed_files.add(filename)  # Mark as processed
             self.setup_chroma()
             self.index_data(filename, df)
             return df
@@ -64,7 +66,7 @@ class CSVChatApp:
             return None
 
     def process_excel(self, uploaded_file, filename: str) -> pd.DataFrame:
-        """Process uploaded Excel file - combines all sheets into one document"""
+        """Process uploaded Excel file - processes each sheet separately"""
         try:
             # Read all sheets from the Excel file
             excel_file = pd.ExcelFile(uploaded_file)
@@ -74,35 +76,53 @@ class CSVChatApp:
                 # Single sheet - read directly
                 df = pd.read_excel(uploaded_file)
                 self.dfs[filename] = df
+                self.processed_files.add(filename)  # Mark as processed
                 self.setup_chroma()
                 self.index_data(filename, df)
                 return df
             else:
-                # Multiple sheets - combine all sheets into one document
+                # Multiple sheets - process each sheet separately
                 st.info(f"Excel file '{filename}' contains {len(sheet_names)} sheets: {sheet_names}")
                 
-                # Read all sheets and combine them
-                all_dfs = []
+                # Setup ChromaDB once for all sheets
+                self.setup_chroma()
+                
+                # Process each sheet separately
+                processed_sheets = []
+                total_rows = 0
+                
                 for sheet_name in sheet_names:
                     try:
                         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
-                        # Add sheet name as a column to identify the source
-                        df['_sheet_name'] = sheet_name
-                        all_dfs.append(df)
-                        st.success(f"✓ Processed sheet: {sheet_name} ({len(df)} rows)")
+                        if len(df) > 0:  # Only process non-empty sheets
+                            # Create unique filename for each sheet
+                            sheet_filename = f"{filename}_{sheet_name}"
+                            self.dfs[sheet_filename] = df
+                            self.processed_files.add(sheet_filename)  # Mark as processed
+                            
+                            # Index this sheet separately
+                            self.index_data(sheet_filename, df)
+                            
+                            processed_sheets.append(sheet_name)
+                            total_rows += len(df)
+                            st.success(f"✓ Processed sheet: {sheet_name} ({len(df)} rows)")
+                        else:
+                            st.warning(f"⚠ Skipped empty sheet: {sheet_name}")
                     except Exception as sheet_error:
                         st.warning(f"⚠ Could not process sheet '{sheet_name}': {str(sheet_error)}")
                         continue
                 
-                if all_dfs:
-                    # Combine all dataframes
-                    combined_df = pd.concat(all_dfs, ignore_index=True)
-                    self.dfs[filename] = combined_df
-                    self.setup_chroma()
-                    self.index_data(filename, combined_df)
+                if processed_sheets:
+                    st.success(f"✅ Processed {len(processed_sheets)} sheets separately: {total_rows} total rows")
                     
-                    st.success(f"✅ Combined {len(sheet_names)} sheets into one document: {len(combined_df)} total rows")
-                    return combined_df
+                    # Return a summary dataframe for display purposes
+                    summary_data = {
+                        'Sheet_Name': processed_sheets,
+                        'Rows': [len(self.dfs[f"{filename}_{sheet}"]) for sheet in processed_sheets],
+                        'Status': ['Processed'] * len(processed_sheets)
+                    }
+                    summary_df = pd.DataFrame(summary_data)
+                    return summary_df
                 else:
                     st.error("No sheets could be processed successfully")
                     return None
@@ -127,6 +147,7 @@ class CSVChatApp:
             
             # Track the uploaded text file
             self.text_files.add(filename)
+            self.processed_files.add(filename)  # Mark as processed
             
             return True
         except Exception as e:
@@ -206,13 +227,7 @@ class CSVChatApp:
 
             for idx, row in df.iterrows():
                 # Create a text representation of the row
-                row_text = " ".join([f"{col}: {val}" for col, val in row.items() if col != '_sheet_name'])
-                
-                # Add sheet information if available
-                sheet_info = ""
-                if '_sheet_name' in row:
-                    sheet_info = f" [Sheet: {row['_sheet_name']}]"
-                    row_text += sheet_info
+                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
                 
                 documents.append(row_text)
                 
@@ -223,9 +238,13 @@ class CSVChatApp:
                     "content_type": "data_row"
                 }
                 
-                # Add sheet information to metadata if available
-                if '_sheet_name' in row:
-                    metadata["sheet_name"] = row['_sheet_name']
+                # Extract sheet name from filename if it contains sheet info
+                if "_" in filename and not filename.endswith('.csv') and not filename.endswith('.xlsx'):
+                    # This is a sheet-specific filename like "file_sheetname"
+                    parts = filename.split("_", 1)
+                    if len(parts) > 1:
+                        metadata["original_file"] = parts[0]
+                        metadata["sheet_name"] = parts[1]
                 
                 metadatas.append(metadata)
                 ids.append(f"{filename}_row_{idx}")
@@ -284,7 +303,8 @@ class CSVChatApp:
                                     'filename': filename,
                                     'type': data_type,
                                     'data': row_data,
-                                    'sheet_name': metadata.get('sheet_name', None)
+                                    'sheet_name': metadata.get('sheet_name', None),
+                                    'original_file': metadata.get('original_file', filename)
                                 })
                             except Exception as row_error:
                                 st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
@@ -314,25 +334,29 @@ class CSVChatApp:
         
         # Add information about all loaded datasets
         for filename, df in self.dfs.items():
-            # Check if this is an Excel file with multiple sheets
-            if '_sheet_name' in df.columns:
-                # Get unique sheet names and their row counts
-                sheet_info = df['_sheet_name'].value_counts().to_dict()
-                sheet_summary = ", ".join([f"{sheet}: {count} rows" for sheet, count in sheet_info.items()])
+            # Check if this is a sheet-specific filename (contains underscore and not a file extension)
+            if "_" in filename and not filename.endswith('.csv') and not filename.endswith('.xlsx'):
+                # This is a sheet from an Excel file
+                parts = filename.split("_", 1)
+                original_file = parts[0]
+                sheet_name = parts[1]
                 
                 context_parts.append(f"""
                 Dataset: {filename}
-                Type: Excel (Multiple Sheets)
-                Sheets: {sheet_summary}
+                Type: Excel Sheet
+                Original File: {original_file}
+                Sheet Name: {sheet_name}
                 Total Rows: {len(df)}
-                Columns: {[col for col in df.columns if col != '_sheet_name']}
+                Columns: {list(df.columns)}
                 Sample Data (first 3 rows):
                 {df.head(3).to_string()}
                 """)
             else:
+                # This is a regular CSV or single-sheet Excel file
+                file_type = "Excel" if filename.endswith(('.xlsx', '.xls')) else "CSV"
                 context_parts.append(f"""
                 Dataset: {filename}
-                Type: CSV
+                Type: {file_type}
                 Columns: {list(df.columns)}
                 Total Rows: {len(df)}
                 Sample Data (first 3 rows):
@@ -358,8 +382,9 @@ class CSVChatApp:
                 """)
                 elif item['type'] == 'excel_row':
                     sheet_info = f" (Sheet: {item['sheet_name']})" if item['sheet_name'] else ""
+                    original_file = item.get('original_file', item['filename'])
                     relevant_data_parts.append(f"""
-                From Excel file {item['filename']}{sheet_info}:
+                From Excel file {original_file}{sheet_info}:
                 {item['data'].to_string()}
                 """)
                 elif item['type'] == 'text_chunk':
@@ -386,12 +411,12 @@ class CSVChatApp:
         """
 
         try:
-            response = client.chat.completions.create(model="gpt-3.5-turbo",
+            response = client.chat.completions.create(model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a helpful data analyst assistant. You help users understand and analyze CSV data and text documents."},
+                {"role": "system", "content": "You are a helpful data analyst assistant. The data you are looking at is advertising spend data related to marketing campaigns. Sometimes the data is spread across multiple sheets. Your job is to indentify helpful information and insights across all of the sheets. When there are multiple sheets, consider information from all of the sheets before giving a response"},
                 {"role": "user", "content": context}
             ],
-            max_tokens=500,
+            max_tokens=1500,
             temperature=0.7)
             return response.choices[0].message.content
         except Exception as e:
@@ -651,7 +676,17 @@ def main():
 
         if uploaded_files:
             for uploaded_file in uploaded_files:
-                if uploaded_file.name not in app.dfs or st.button(f"Reload {uploaded_file.name}"):
+                # Check if this file has already been processed
+                file_already_processed = uploaded_file.name in app.processed_files
+                
+                # Also check for Excel sheets that might have been processed
+                if not file_already_processed:
+                    for existing_filename in app.processed_files:
+                        if existing_filename.startswith(uploaded_file.name + "_"):
+                            file_already_processed = True
+                            break
+                
+                if not file_already_processed or st.button(f"Reload {uploaded_file.name}"):
                     with st.spinner(f"Processing {uploaded_file.name}..."):
                         # Determine file type and process accordingly
                         if uploaded_file.name.lower().endswith('.csv'):
@@ -664,8 +699,15 @@ def main():
                             
                         if df is not None:
                             st.success(f"{uploaded_file.name} processed successfully!")
-                            st.write(f"**Shape:** {df.shape}")
-                            st.write(f"**Columns:** {list(df.columns)}")
+                            if hasattr(df, 'shape'):
+                                st.write(f"**Shape:** {df.shape}")
+                                st.write(f"**Columns:** {list(df.columns)}")
+                            else:
+                                # This is a summary dataframe for multi-sheet Excel files
+                                st.write("**Processed Sheets:**")
+                                st.dataframe(df)
+                else:
+                    st.info(f"✅ {uploaded_file.name} already processed")
         
         # Text file upload
         #st.subheader("📄 Text Files")
@@ -678,12 +720,16 @@ def main():
         
         if uploaded_text_files:
             for uploaded_file in uploaded_text_files:
-                with st.spinner(f"Processing text file {uploaded_file.name}..."):
-                    success = app.process_text_file(uploaded_file, uploaded_file.name)
-                    if success:
-                        st.success(f"Text file '{uploaded_file.name}' processed and added to vector database!")
-                    else:
-                        st.error(f"Failed to process text file '{uploaded_file.name}'")
+                # Check if this text file has already been processed
+                if uploaded_file.name not in app.processed_files:
+                    with st.spinner(f"Processing text file {uploaded_file.name}..."):
+                        success = app.process_text_file(uploaded_file, uploaded_file.name)
+                        if success:
+                            st.success(f"Text file '{uploaded_file.name}' processed and added to vector database!")
+                        else:
+                            st.error(f"Failed to process text file '{uploaded_file.name}'")
+                else:
+                    st.info(f"✅ Text file '{uploaded_file.name}' already processed")
         
         # Show loaded datasets
         if app.dfs or app.text_files:
@@ -702,6 +748,7 @@ def main():
                 app.dfs.clear()
                 app.text_files.clear()
                 app.text_contents.clear()
+                app.processed_files.clear()  # Clear processed files tracking
                 app.setup_chroma()  # This will clear the ChromaDB collection
                 st.success("All data cleared!")
                 st.rerun()
@@ -709,13 +756,17 @@ def main():
             # Show CSV datasets
             for filename, df in app.dfs.items():
                 with st.expander(f"📊 {filename} ({len(df)} rows)"):
-                    st.dataframe(df.head(10))
+                    st.dataframe(df.head(10000))
                     st.write(f"**Columns:** {list(df.columns)}")
                     
                     # Add remove button for individual datasets
                     if st.button(f"❌ Remove {filename}", key=f"remove_csv_{filename}"):
                         # Remove from memory
                         del app.dfs[filename]
+                        
+                        # Remove from processed files tracking
+                        if filename in app.processed_files:
+                            app.processed_files.remove(filename)
                         
                         # Remove from ChromaDB
                         if app.collection:
@@ -777,6 +828,10 @@ def main():
                         if filename in app.text_contents:
                             del app.text_contents[filename]
                         
+                        # Remove from processed files tracking
+                        if filename in app.processed_files:
+                            app.processed_files.remove(filename)
+                        
                         # Remove from ChromaDB
                         if app.collection:
                             try:
@@ -809,7 +864,7 @@ def main():
             # Show CSV datasets
             for filename, df in app.dfs.items():
                 st.subheader(f"📊 {filename}")
-                st.dataframe(df.head(10))
+                st.dataframe(df.head(100))
                 st.write("---")
             
             # Show text documents
