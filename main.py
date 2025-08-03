@@ -225,37 +225,67 @@ class CSVChatApp:
             metadatas = []
             ids = []
 
-            for idx, row in df.iterrows():
-                # Create a text representation of the row
-                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+            # Create semantic chunks instead of just individual rows
+            chunk_size = 5  # Number of rows per chunk
+            for chunk_start in range(0, len(df), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(df))
+                chunk_df = df.iloc[chunk_start:chunk_end]
                 
-                documents.append(row_text)
+                # Create semantic representation of the chunk
+                chunk_parts = []
+                chunk_parts.append(f"Data chunk {chunk_start//chunk_size + 1} (rows {chunk_start}-{chunk_end-1}):")
                 
-                # Enhanced metadata
+                # Add summary stats for the chunk
+                numeric_cols = chunk_df.select_dtypes(include=['number']).columns.tolist()
+                if numeric_cols:
+                    chunk_parts.append("Numeric summaries:")
+                    for col in numeric_cols:
+                        chunk_parts.append(f"  {col}: sum={chunk_df[col].sum():.2f}, avg={chunk_df[col].mean():.2f}")
+                
+                # Add individual rows with context
+                for idx, row in chunk_df.iterrows():
+                    row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                    chunk_parts.append(f"Row {idx}: {row_text}")
+                
+                chunk_text = "\n".join(chunk_parts)
+                documents.append(chunk_text)
+                
+                # Enhanced metadata for chunks
                 metadata = {
-                    "row_index": idx, 
+                    "chunk_index": chunk_start // chunk_size,
+                    "start_row": chunk_start,
+                    "end_row": chunk_end - 1,
                     "filename": filename,
-                    "content_type": "data_row"
+                    "content_type": "data_chunk",
+                    "row_count": len(chunk_df)
                 }
                 
                 # Extract sheet name from filename if it contains sheet info
                 if "_" in filename and not filename.endswith('.csv') and not filename.endswith('.xlsx'):
-                    # This is a sheet-specific filename like "file_sheetname"
                     parts = filename.split("_", 1)
                     if len(parts) > 1:
                         metadata["original_file"] = parts[0]
                         metadata["sheet_name"] = parts[1]
                 
                 metadatas.append(metadata)
-                ids.append(f"{filename}_row_{idx}")
+                ids.append(f"{filename}_chunk_{chunk_start//chunk_size}")
 
+            # Validate that all arrays have the same length
+            if len(documents) != len(metadatas) or len(documents) != len(ids):
+                st.error(f"Length mismatch: documents={len(documents)}, metadatas={len(metadatas)}, ids={len(ids)}")
+                return
+            
             # Add to ChromaDB
             self.collection.add(
                 documents=documents,
                 metadatas=metadatas,
                 ids=ids
             )
-            st.success(f"Indexed {len(documents)} rows from {filename} in ChromaDB")
+            
+            # Add dataset-level summary document
+            self.add_dataset_summary(filename, df)
+            
+            st.success(f"Indexed {len(documents)} chunks from {filename} in ChromaDB")
         except Exception as e:
             st.error(f"Error indexing data from {filename}: {str(e)}")
 
@@ -268,6 +298,11 @@ class CSVChatApp:
             st.error("ChromaDB collection is None. Please try uploading your files again.")
             return "Please upload a CSV file or text document first to initialize the search index."
 
+        # Check if query requires aggregation
+        query_lower = user_query.lower()
+        aggregation_keywords = ['sum', 'total', 'average', 'mean', 'count', 'aggregate', 'group by']
+        requires_aggregation = any(keyword in query_lower for keyword in aggregation_keywords)
+
         try:
             # Check if collection has any data
             collection_count = self.collection.count()
@@ -278,11 +313,20 @@ class CSVChatApp:
             total_csv_rows = sum(len(df) for df in self.dfs.values())
             total_items = max(collection_count, total_csv_rows, 1)  # Ensure at least 1
             
-            # Search for relevant data
+            # Search for relevant data - prioritize summary documents
             results = self.collection.query(
                 query_texts=[user_query],
-                n_results=min(10, total_items)
+                n_results=min(15, total_items),  # Get more results to filter
+                where={"content_type": "dataset_summary"}  # First get summaries
             )
+            
+            # If no summary results, search for chunks
+            if not results['ids'] or not results['ids'][0]:
+                results = self.collection.query(
+                    query_texts=[user_query],
+                    n_results=min(10, total_items),
+                    where={"content_type": "data_chunk"}
+                )
 
             # Get relevant data from all sources
             relevant_data = []
@@ -331,6 +375,14 @@ class CSVChatApp:
 
         # Create context for OpenAI
         context_parts = []
+        
+        # If aggregation is needed, perform it first
+        aggregation_results = ""
+        if requires_aggregation:
+            aggregation_results = self.perform_aggregation(user_query)
+        
+        # Add cross-dataset insights
+        cross_dataset_insights = self.generate_cross_dataset_insights(user_query)
         
         # Add information about all loaded datasets
         for filename, df in self.dfs.items():
@@ -400,14 +452,19 @@ class CSVChatApp:
         Available Datasets:
         {chr(10).join(context_parts)}
         
+        {f"Aggregation Results: {aggregation_results}" if aggregation_results else ""}
+        
+        {f"Cross-Dataset Insights: {cross_dataset_insights}" if cross_dataset_insights else ""}
+        
         Relevant Data for Query:
         {relevant_data_text}
         
         User Query: {user_query}
         
-        Please provide a helpful response based on this data. If the query asks for analysis, 
-        provide insights. If it asks for specific data, provide the relevant information.
-        Be conversational and helpful. When referencing data, mention which dataset it comes from.
+        Please provide a helpful response based on this data. Consider the holistic view of all datasets,
+        their relationships, and patterns. If the query asks for analysis, provide comprehensive insights
+        that span across the entire dataset. If it asks for specific data, provide the relevant information
+        with context about how it fits into the broader picture. Be conversational and helpful.
         """
 
         try:
@@ -421,6 +478,209 @@ class CSVChatApp:
             return response.choices[0].message.content
         except Exception as e:
             return f"Error generating response: {str(e)}"
+
+    def add_dataset_summary(self, filename: str, df: pd.DataFrame):
+        """Add a comprehensive dataset summary to the vector database"""
+        try:
+            # Create comprehensive dataset summary
+            summary_parts = []
+            
+            # Basic info
+            summary_parts.append(f"Dataset: {filename}")
+            summary_parts.append(f"Total rows: {len(df)}")
+            summary_parts.append(f"Total columns: {len(df.columns)}")
+            
+            # Column analysis
+            summary_parts.append("Columns:")
+            for col in df.columns:
+                col_type = str(df[col].dtype)
+                unique_count = df[col].nunique()
+                null_count = df[col].isnull().sum()
+                
+                if df[col].dtype in ['int64', 'float64']:
+                    # Numeric column stats
+                    min_val = df[col].min()
+                    max_val = df[col].max()
+                    mean_val = df[col].mean()
+                    summary_parts.append(f"  - {col} ({col_type}): {unique_count} unique values, range {min_val:.2f} to {max_val:.2f}, mean {mean_val:.2f}")
+                else:
+                    # Categorical column stats
+                    top_values = df[col].value_counts().head(3).to_dict()
+                    summary_parts.append(f"  - {col} ({col_type}): {unique_count} unique values, top values: {top_values}")
+            
+            # Data patterns and insights
+            summary_parts.append("Data Patterns:")
+            
+            # Find relationships between columns
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+            
+            if len(numeric_cols) >= 2:
+                # Correlation insights
+                corr_matrix = df[numeric_cols].corr()
+                high_corr_pairs = []
+                for i in range(len(corr_matrix.columns)):
+                    for j in range(i+1, len(corr_matrix.columns)):
+                        corr_val = corr_matrix.iloc[i, j]
+                        if abs(corr_val) > 0.7:  # High correlation threshold
+                            high_corr_pairs.append(f"{corr_matrix.columns[i]} and {corr_matrix.columns[j]} (correlation: {corr_val:.2f})")
+                
+                if high_corr_pairs:
+                    summary_parts.append(f"  - High correlations: {', '.join(high_corr_pairs)}")
+            
+            # Grouping insights
+            if categorical_cols and numeric_cols:
+                for cat_col in categorical_cols[:3]:  # Limit to first 3 categorical columns
+                    for num_col in numeric_cols[:3]:  # Limit to first 3 numeric columns
+                        grouped_stats = df.groupby(cat_col)[num_col].agg(['mean', 'count']).reset_index()
+                        top_group = grouped_stats.loc[grouped_stats['mean'].idxmax()]
+                        summary_parts.append(f"  - {cat_col} '{top_group[cat_col]}' has highest average {num_col}: {top_group['mean']:.2f}")
+            
+            # Sample data patterns
+            summary_parts.append("Sample Data Patterns:")
+            for i in range(min(3, len(df))):
+                row = df.iloc[i]
+                pattern = f"  Row {i}: " + ", ".join([f"{col}={val}" for col, val in row.items() if pd.notna(val)][:5])
+                summary_parts.append(pattern)
+            
+            # Create the summary document
+            summary_text = "\n".join(summary_parts)
+            
+            # Add to ChromaDB
+            self.collection.add(
+                documents=[summary_text],
+                metadatas=[{
+                    "filename": filename,
+                    "content_type": "dataset_summary",
+                    "row_count": len(df),
+                    "column_count": len(df.columns)
+                }],
+                ids=[f"{filename}_summary"]
+            )
+            
+        except Exception as e:
+            st.warning(f"Error creating dataset summary for {filename}: {str(e)}")
+
+    def perform_aggregation(self, query: str) -> str:
+        """Perform data aggregations based on user query"""
+        query_lower = query.lower()
+        results = []
+        
+        for filename, df in self.dfs.items():
+            try:
+                # Find numeric columns
+                numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+                
+                # Find categorical columns for grouping
+                categorical_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+                
+                # Check for aggregation requests
+                if 'sum' in query_lower:
+                    # Find what to sum
+                    for col in numeric_cols:
+                        if col.lower() in query_lower or any(word in col.lower() for word in ['spend', 'amount', 'value', 'cost']):
+                            # Check if grouping is requested
+                            if 'by' in query_lower:
+                                # Find group by column
+                                for cat_col in categorical_cols:
+                                    if cat_col.lower() in query_lower or any(word in cat_col.lower() for word in ['platform', 'channel', 'category', 'type']):
+                                        grouped = df.groupby(cat_col)[col].sum().reset_index()
+                                        results.append(f"Sum of {col} by {cat_col} in {filename}:\n{grouped.to_string()}")
+                                        break
+                            else:
+                                total = df[col].sum()
+                                results.append(f"Total sum of {col} in {filename}: {total:,.2f}")
+                
+                elif 'average' in query_lower or 'mean' in query_lower:
+                    for col in numeric_cols:
+                        if col.lower() in query_lower or any(word in col.lower() for word in ['spend', 'amount', 'value', 'cost']):
+                            if 'by' in query_lower:
+                                for cat_col in categorical_cols:
+                                    if cat_col.lower() in query_lower or any(word in cat_col.lower() for word in ['platform', 'channel', 'category', 'type']):
+                                        grouped = df.groupby(cat_col)[col].mean().reset_index()
+                                        results.append(f"Average of {col} by {cat_col} in {filename}:\n{grouped.to_string()}")
+                                        break
+                            else:
+                                avg = df[col].mean()
+                                results.append(f"Average of {col} in {filename}: {avg:,.2f}")
+                
+                elif 'count' in query_lower:
+                    if 'by' in query_lower:
+                        for cat_col in categorical_cols:
+                            if cat_col.lower() in query_lower:
+                                counts = df[cat_col].value_counts().reset_index()
+                                counts.columns = [cat_col, 'count']
+                                results.append(f"Count by {cat_col} in {filename}:\n{counts.to_string()}")
+                                break
+                    else:
+                        results.append(f"Total count in {filename}: {len(df)} rows")
+                        
+            except Exception as e:
+                results.append(f"Error processing {filename}: {str(e)}")
+        
+        return "\n\n".join(results) if results else ""
+
+    def generate_cross_dataset_insights(self, query: str) -> str:
+        """Generate insights across multiple datasets"""
+        if len(self.dfs) < 2:
+            return ""
+        
+        insights = []
+        query_lower = query.lower()
+        
+        try:
+            # Find common columns across datasets
+            all_columns = {}
+            for filename, df in self.dfs.items():
+                for col in df.columns:
+                    if col not in all_columns:
+                        all_columns[col] = []
+                    all_columns[col].append(filename)
+            
+            # Find columns that appear in multiple datasets
+            common_columns = {col: files for col, files in all_columns.items() if len(files) > 1}
+            
+            if common_columns:
+                insights.append("Cross-Dataset Analysis:")
+                
+                for col, files in common_columns.items():
+                    if col.lower() in query_lower or any(word in col.lower() for word in ['spend', 'amount', 'value', 'platform', 'channel']):
+                        insights.append(f"\nColumn '{col}' appears in {len(files)} datasets: {', '.join(files)}")
+                        
+                        # Compare values across datasets
+                        col_values = {}
+                        for filename in files:
+                            df = self.dfs[filename]
+                            if col in df.columns:
+                                if df[col].dtype in ['int64', 'float64']:
+                                    col_values[filename] = {
+                                        'sum': df[col].sum(),
+                                        'mean': df[col].mean(),
+                                        'count': len(df)
+                                    }
+                                else:
+                                    col_values[filename] = {
+                                        'unique': df[col].nunique(),
+                                        'top_values': df[col].value_counts().head(3).to_dict()
+                                    }
+                        
+                        # Add comparison insights
+                        if col_values:
+                            insights.append(f"  Comparison for '{col}':")
+                            for filename, stats in col_values.items():
+                                if 'sum' in stats:
+                                    insights.append(f"    {filename}: sum={stats['sum']:.2f}, avg={stats['mean']:.2f}, count={stats['count']}")
+                                else:
+                                    insights.append(f"    {filename}: {stats['unique']} unique values, top: {stats['top_values']}")
+            
+            # Add overall dataset comparison
+            total_rows = sum(len(df) for df in self.dfs.values())
+            insights.append(f"\nOverall: {len(self.dfs)} datasets with {total_rows} total rows")
+            
+        except Exception as e:
+            insights.append(f"Error in cross-dataset analysis: {str(e)}")
+        
+        return "\n".join(insights)
 
     def generate_visualization(self, query: str):
         """Generate visualizations based on user query"""
@@ -472,17 +732,31 @@ class CSVChatApp:
             
             if group_col_actual and intent['columns']:
                 value_col = intent['columns'][0]
-                # Aggregate if needed
-                if intent['parameters'].get('aggregation') == 'mean':
-                    data = df.groupby(group_col_actual)[value_col].mean().reset_index()
-                elif intent['parameters'].get('aggregation') == 'sum':
-                    data = df.groupby(group_col_actual)[value_col].sum().reset_index()
-                else:
-                    data = df.groupby(group_col_actual)[value_col].count().reset_index()
                 
-                fig = px.bar(data, x=group_col_actual, y=value_col,
-                           title=f"{value_col} by {group_col_actual}")
-                return fig
+                # Check if columns exist
+                if value_col not in df.columns:
+                    st.error(f"Column '{value_col}' not found in dataset. Available columns: {list(df.columns)}")
+                    return None
+                
+                if group_col_actual not in df.columns:
+                    st.error(f"Column '{group_col_actual}' not found in dataset. Available columns: {list(df.columns)}")
+                    return None
+                
+                try:
+                    # Aggregate if needed
+                    if intent['parameters'].get('aggregation') == 'mean':
+                        data = df.groupby(group_col_actual)[value_col].mean().reset_index()
+                    elif intent['parameters'].get('aggregation') == 'sum':
+                        data = df.groupby(group_col_actual)[value_col].sum().reset_index()
+                    else:
+                        data = df.groupby(group_col_actual)[value_col].count().reset_index()
+                    
+                    fig = px.bar(data, x=group_col_actual, y=value_col,
+                               title=f"{value_col} by {group_col_actual}")
+                    return fig
+                except Exception as e:
+                    st.error(f"Error creating chart: {str(e)}")
+                    return None
         
         # Simple bar chart of first column
         if intent['columns']:
@@ -618,7 +892,11 @@ class CSVChatApp:
         for df_name, df in self.dfs.items():
             for col in df.columns:
                 col_lower = col.lower().replace('_', ' ')
-                if col_lower in query or col in query:
+                # More flexible matching
+                if (col_lower in query or 
+                    col in query or 
+                    col_lower.replace(' ', '') in query.replace(' ', '') or
+                    any(word in col_lower for word in query.split())):
                     columns.append(col)
                     datasets.append(df_name)
         
@@ -648,7 +926,7 @@ class CSVChatApp:
 def main():
     st.set_page_config(
         page_title="ABI - Agentic Business Intelligence",
-        page_icon="📊",
+        page_icon="abi_lime.png",
         layout="wide"
     )
 
@@ -910,6 +1188,11 @@ def main():
                         st.subheader("📊 Generated Visualization")
                         st.plotly_chart(viz, use_container_width=True)
                         st.caption(f"Chart type: {app.parse_visualization_intent(prompt)['chart_type']}")
+                    else:
+                        # Debug info
+                        intent = app.parse_visualization_intent(prompt)
+                        if intent['chart_type']:
+                            st.info(f"Debug: Chart type detected: {intent['chart_type']}, Columns: {intent['columns']}, Parameters: {intent['parameters']}")
 
             # Add assistant response to chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
