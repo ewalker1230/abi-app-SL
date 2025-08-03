@@ -63,6 +63,53 @@ class CSVChatApp:
             st.error(f"Error processing CSV: {str(e)}")
             return None
 
+    def process_excel(self, uploaded_file, filename: str) -> pd.DataFrame:
+        """Process uploaded Excel file - combines all sheets into one document"""
+        try:
+            # Read all sheets from the Excel file
+            excel_file = pd.ExcelFile(uploaded_file)
+            sheet_names = excel_file.sheet_names
+            
+            if len(sheet_names) == 1:
+                # Single sheet - read directly
+                df = pd.read_excel(uploaded_file)
+                self.dfs[filename] = df
+                self.setup_chroma()
+                self.index_data(filename, df)
+                return df
+            else:
+                # Multiple sheets - combine all sheets into one document
+                st.info(f"Excel file '{filename}' contains {len(sheet_names)} sheets: {sheet_names}")
+                
+                # Read all sheets and combine them
+                all_dfs = []
+                for sheet_name in sheet_names:
+                    try:
+                        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+                        # Add sheet name as a column to identify the source
+                        df['_sheet_name'] = sheet_name
+                        all_dfs.append(df)
+                        st.success(f"✓ Processed sheet: {sheet_name} ({len(df)} rows)")
+                    except Exception as sheet_error:
+                        st.warning(f"⚠ Could not process sheet '{sheet_name}': {str(sheet_error)}")
+                        continue
+                
+                if all_dfs:
+                    # Combine all dataframes
+                    combined_df = pd.concat(all_dfs, ignore_index=True)
+                    self.dfs[filename] = combined_df
+                    self.setup_chroma()
+                    self.index_data(filename, combined_df)
+                    
+                    st.success(f"✅ Combined {len(sheet_names)} sheets into one document: {len(combined_df)} total rows")
+                    return combined_df
+                else:
+                    st.error("No sheets could be processed successfully")
+                    return None
+        except Exception as e:
+            st.error(f"Error processing Excel file: {str(e)}")
+            return None
+
     def process_text_file(self, uploaded_file, filename: str) -> bool:
         """Process uploaded text file and add to vector database"""
         try:
@@ -143,7 +190,7 @@ class CSVChatApp:
             st.error(f"Error indexing text data from {filename}: {str(e)}")
 
     def index_data(self, filename: str, df: pd.DataFrame):
-        """Index CSV data for semantic search"""
+        """Index data for semantic search"""
         if df is None:
             return
 
@@ -159,9 +206,28 @@ class CSVChatApp:
 
             for idx, row in df.iterrows():
                 # Create a text representation of the row
-                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                row_text = " ".join([f"{col}: {val}" for col, val in row.items() if col != '_sheet_name'])
+                
+                # Add sheet information if available
+                sheet_info = ""
+                if '_sheet_name' in row:
+                    sheet_info = f" [Sheet: {row['_sheet_name']}]"
+                    row_text += sheet_info
+                
                 documents.append(row_text)
-                metadatas.append({"row_index": idx, "filename": filename})
+                
+                # Enhanced metadata
+                metadata = {
+                    "row_index": idx, 
+                    "filename": filename,
+                    "content_type": "data_row"
+                }
+                
+                # Add sheet information to metadata if available
+                if '_sheet_name' in row:
+                    metadata["sheet_name"] = row['_sheet_name']
+                
+                metadatas.append(metadata)
                 ids.append(f"{filename}_row_{idx}")
 
             # Add to ChromaDB
@@ -206,14 +272,19 @@ class CSVChatApp:
                     if metadata and 'filename' in metadata:
                         filename = metadata['filename']
                         
-                        # Handle CSV data
+                        # Handle data rows (CSV or Excel)
                         if 'row_index' in metadata and filename in self.dfs:
                             try:
                                 row_idx = metadata['row_index']
+                                row_data = self.dfs[filename].iloc[row_idx]
+                                
+                                # Determine data type and add sheet info if available
+                                data_type = 'csv_row' if 'sheet_name' not in metadata else 'excel_row'
                                 relevant_data.append({
                                     'filename': filename,
-                                    'type': 'csv_row',
-                                    'data': self.dfs[filename].iloc[row_idx]
+                                    'type': data_type,
+                                    'data': row_data,
+                                    'sheet_name': metadata.get('sheet_name', None)
                                 })
                             except Exception as row_error:
                                 st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
@@ -243,14 +314,30 @@ class CSVChatApp:
         
         # Add information about all loaded datasets
         for filename, df in self.dfs.items():
-            context_parts.append(f"""
-            Dataset: {filename}
-            Type: CSV
-            Columns: {list(df.columns)}
-            Total Rows: {len(df)}
-            Sample Data (first 3 rows):
-            {df.head(3).to_string()}
-            """)
+            # Check if this is an Excel file with multiple sheets
+            if '_sheet_name' in df.columns:
+                # Get unique sheet names and their row counts
+                sheet_info = df['_sheet_name'].value_counts().to_dict()
+                sheet_summary = ", ".join([f"{sheet}: {count} rows" for sheet, count in sheet_info.items()])
+                
+                context_parts.append(f"""
+                Dataset: {filename}
+                Type: Excel (Multiple Sheets)
+                Sheets: {sheet_summary}
+                Total Rows: {len(df)}
+                Columns: {[col for col in df.columns if col != '_sheet_name']}
+                Sample Data (first 3 rows):
+                {df.head(3).to_string()}
+                """)
+            else:
+                context_parts.append(f"""
+                Dataset: {filename}
+                Type: CSV
+                Columns: {list(df.columns)}
+                Total Rows: {len(df)}
+                Sample Data (first 3 rows):
+                {df.head(3).to_string()}
+                """)
         
         # Add information about text files
         for filename in self.text_files:
@@ -267,6 +354,12 @@ class CSVChatApp:
                 if item['type'] == 'csv_row':
                     relevant_data_parts.append(f"""
                 From CSV file {item['filename']}:
+                {item['data'].to_string()}
+                """)
+                elif item['type'] == 'excel_row':
+                    sheet_info = f" (Sheet: {item['sheet_name']})" if item['sheet_name'] else ""
+                    relevant_data_parts.append(f"""
+                From Excel file {item['filename']}{sheet_info}:
                 {item['data'].to_string()}
                 """)
                 elif item['type'] == 'text_chunk':
@@ -535,7 +628,7 @@ def main():
     )
 
     st.title("ABI - Agentic Business Intelligence")
-    st.markdown("Upload CSV files and text documents to chat with your data in natural language!")
+    st.markdown("Upload CSV, Excel files and text documents to chat with your data in natural language!")
 
     # Initialize app
     if 'app' not in st.session_state:
@@ -547,20 +640,28 @@ def main():
     with st.sidebar:
         st.header("📁 Upload Data")
         
-        # CSV file upload
-        #st.subheader("📊 CSV Files")
+        # Data file upload (CSV and Excel)
+        #st.subheader("📊 Data Files")
         uploaded_files = st.file_uploader(
-            "Choose CSV files",
-            type=['csv'],
+            "Choose CSV or Excel files",
+            type=['csv', 'xlsx', 'xls'],
             accept_multiple_files=True,
-            help="Upload one or more CSV files to start chatting with them"
+            help="Upload one or more CSV or Excel files to start chatting with them"
         )
 
         if uploaded_files:
             for uploaded_file in uploaded_files:
                 if uploaded_file.name not in app.dfs or st.button(f"Reload {uploaded_file.name}"):
                     with st.spinner(f"Processing {uploaded_file.name}..."):
-                        df = app.process_csv(uploaded_file, uploaded_file.name)
+                        # Determine file type and process accordingly
+                        if uploaded_file.name.lower().endswith('.csv'):
+                            df = app.process_csv(uploaded_file, uploaded_file.name)
+                        elif uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+                            df = app.process_excel(uploaded_file, uploaded_file.name)
+                        else:
+                            st.error(f"Unsupported file type: {uploaded_file.name}")
+                            continue
+                            
                         if df is not None:
                             st.success(f"{uploaded_file.name} processed successfully!")
                             st.write(f"**Shape:** {df.shape}")
@@ -764,7 +865,7 @@ def main():
             st.rerun()
 
     else:
-        st.info("👆 Please upload a CSV file in the sidebar to get started!")
+        st.info("👆 Please upload a CSV or Excel file in the sidebar to get started!")
 
         # Example queries
         st.header("💡 Example Questions")
