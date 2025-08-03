@@ -647,7 +647,7 @@ class CSVChatApp:
 
 def main():
     st.set_page_config(
-        page_title="CSV Chat Assistant",
+        page_title="ABI - Agentic Business Intelligence",
         page_icon="📊",
         layout="wide"
     )

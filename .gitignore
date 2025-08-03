@@ -11,3 +11,4 @@ wheels/
 .venv
 chroma_db/
 data/
+files/
