@@ -7,23 +7,228 @@ from openai import OpenAI
 import chromadb
 import plotly.express as px
 import plotly.graph_objects as go
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import re
+import hashlib
+from functools import lru_cache
+import time
 
 # LangChain imports
 from langchain_community.document_loaders import CSVLoader, UnstructuredExcelLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import LLMChainExtractor
 
 # Load environment variables
 load_dotenv()
 
 # Configure OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+class QueryOptimizer:
+    """Optimizes RAG queries for better performance and accuracy"""
+    
+    def __init__(self):
+        self.query_cache = {}
+        self.context_cache = {}
+        self.search_strategies = {
+            'exact_match': self._exact_match_search,
+            'semantic_search': self._semantic_search,
+            'hybrid_search': self._hybrid_search,
+            'aggregation_search': self._aggregation_search
+        }
+    
+    def preprocess_query(self, query: str) -> Dict[str, Any]:
+        """Analyze and preprocess the query to determine optimal search strategy"""
+        query_lower = query.lower()
+        
+        # Detect query intent
+        intent = self._detect_query_intent(query_lower)
+        
+        # Extract key terms for search optimization
+        key_terms = self._extract_key_terms(query)
+        
+        # Determine optimal search strategy
+        strategy = self._determine_search_strategy(intent, key_terms)
+        
+        # Estimate query complexity
+        complexity = self._estimate_complexity(query, intent)
+        
+        return {
+            'original_query': query,
+            'processed_query': self._optimize_query_text(query, key_terms),
+            'intent': intent,
+            'key_terms': key_terms,
+            'strategy': strategy,
+            'complexity': complexity,
+            'requires_aggregation': intent.get('aggregation', False),
+            'requires_cross_dataset': intent.get('cross_dataset', False)
+        }
+    
+    def _detect_query_intent(self, query: str) -> Dict[str, Any]:
+        """Detect the intent of the query"""
+        intent = {
+            'aggregation': False,
+            'cross_dataset': False,
+            'visualization': False,
+            'comparison': False,
+            'filtering': False,
+            'ranking': False
+        }
+        
+        # Aggregation detection
+        agg_keywords = ['sum', 'total', 'average', 'mean', 'count', 'aggregate', 'group by', 'total spend']
+        intent['aggregation'] = any(keyword in query for keyword in agg_keywords)
+        
+        # Cross-dataset detection
+        cross_keywords = ['across', 'compare', 'between', 'all datasets', 'multiple', 'sheets']
+        intent['cross_dataset'] = any(keyword in query for keyword in cross_keywords)
+        
+        # Visualization detection
+        viz_keywords = ['chart', 'graph', 'plot', 'visualize', 'show me', 'display']
+        intent['visualization'] = any(keyword in query for keyword in viz_keywords)
+        
+        # Comparison detection
+        comp_keywords = ['vs', 'versus', 'compare', 'difference', 'better', 'worse']
+        intent['comparison'] = any(keyword in query for keyword in comp_keywords)
+        
+        # Filtering detection
+        filter_keywords = ['where', 'filter', 'only', 'show', 'find', 'search']
+        intent['filtering'] = any(keyword in query for keyword in filter_keywords)
+        
+        return intent
+    
+    def _extract_key_terms(self, query: str) -> List[str]:
+        """Extract key terms for search optimization"""
+        # Remove common stop words
+        stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them'}
+        
+        # Extract words and filter
+        words = re.findall(r'\b\w+\b', query.lower())
+        key_terms = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        return key_terms
+    
+    def _determine_search_strategy(self, intent: Dict[str, Any], key_terms: List[str]) -> str:
+        """Determine the optimal search strategy based on intent and terms"""
+        if intent['aggregation']:
+            return 'aggregation_search'
+        elif intent['cross_dataset']:
+            return 'hybrid_search'
+        elif intent['filtering'] and len(key_terms) > 2:
+            return 'exact_match'
+        else:
+            return 'semantic_search'
+    
+    def _estimate_complexity(self, query: str, intent: Dict[str, Any]) -> str:
+        """Estimate query complexity for adaptive search parameters"""
+        word_count = len(query.split())
+        
+        if intent['aggregation'] or intent['cross_dataset']:
+            return 'high'
+        elif word_count > 10 or intent['comparison']:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _optimize_query_text(self, query: str, key_terms: List[str]) -> str:
+        """Optimize query text for better vector search"""
+        # Enhance query with key terms if they're not prominent
+        enhanced_terms = []
+        
+        # Add common business terms that might be relevant
+        business_terms = ['spend', 'campaign', 'platform', 'channel', 'performance', 'roi', 'conversion']
+        for term in business_terms:
+            if term in query.lower() and term not in enhanced_terms:
+                enhanced_terms.append(term)
+        
+        # Combine original query with enhanced terms
+        if enhanced_terms:
+            enhanced_query = f"{query} {' '.join(enhanced_terms)}"
+        else:
+            enhanced_query = query
+            
+        return enhanced_query
+
+    def _exact_match_search(self, vectorstore, query: str, k: int = 5) -> List:
+        """Perform exact match search for specific terms"""
+        # Use a more focused search with higher similarity threshold
+        docs = vectorstore.similarity_search_with_score(query, k=k*2)
+        # Filter by similarity score (higher is better)
+        filtered_docs = [doc for doc, score in docs if score > 0.7]
+        return filtered_docs[:k]
+    
+    def _semantic_search(self, vectorstore, query: str, k: int = 10) -> List:
+        """Perform semantic search with optimized parameters"""
+        return vectorstore.similarity_search(query, k=k)
+    
+    def _hybrid_search(self, vectorstore, query: str, k: int = 15) -> List:
+        """Perform hybrid search combining multiple strategies"""
+        # Get semantic results
+        semantic_docs = vectorstore.similarity_search(query, k=k//2)
+        
+        # Get MMR results for diversity
+        mmr_docs = vectorstore.max_marginal_relevance_search(query, k=k//2, fetch_k=k)
+        
+        # Combine and deduplicate
+        all_docs = semantic_docs + mmr_docs
+        seen = set()
+        unique_docs = []
+        for doc in all_docs:
+            doc_hash = hash(doc.page_content)
+            if doc_hash not in seen:
+                seen.add(doc_hash)
+                unique_docs.append(doc)
+        
+        return unique_docs[:k]
+    
+    def _aggregation_search(self, vectorstore, query: str, k: int = 20) -> List:
+        """Perform search optimized for aggregation queries"""
+        # For aggregations, we want more diverse results
+        return vectorstore.max_marginal_relevance_search(query, k=k, fetch_k=k*2)
+    
+    def get_adaptive_k(self, complexity: str, intent: Dict[str, Any]) -> int:
+        """Get adaptive k value based on query complexity and intent"""
+        base_k = {
+            'low': 5,
+            'medium': 10,
+            'high': 15
+        }
+        
+        k = base_k.get(complexity, 10)
+        
+        # Adjust based on intent
+        if intent.get('aggregation'):
+            k *= 2  # Need more data for aggregations
+        elif intent.get('cross_dataset'):
+            k *= 1.5  # Need data from multiple sources
+        elif intent.get('filtering'):
+            k = min(k, 8)  # More focused results for filtering
+        
+        return k
+    
+    def cache_query_result(self, query_hash: str, result: Any, ttl: int = 300):
+        """Cache query result with TTL"""
+        self.query_cache[query_hash] = {
+            'result': result,
+            'timestamp': time.time(),
+            'ttl': ttl
+        }
+    
+    def get_cached_result(self, query_hash: str) -> Optional[Any]:
+        """Get cached result if still valid"""
+        if query_hash in self.query_cache:
+            cache_entry = self.query_cache[query_hash]
+            if time.time() - cache_entry['timestamp'] < cache_entry['ttl']:
+                return cache_entry['result']
+            else:
+                del self.query_cache[query_hash]
+        return None
 
 class CSVChatApp:
     def __init__(self):
@@ -35,6 +240,11 @@ class CSVChatApp:
         self.text_splitter = None  # Text splitter
         self.chat_history = []
         self.processed_files = set()  # Set to track processed file names
+        self.query_optimizer = QueryOptimizer()  # Query optimization system
+        self.dataset_summaries = {}  # Cache for dataset summaries
+        self.query_cache = {}  # Cache for query results
+        self.performance_metrics = {}  # Track query performance
+        self.query_history = []  # Track query patterns for optimization
 
     def setup_langchain(self):
         """Initialize LangChain components for vector storage"""
@@ -406,7 +616,9 @@ class CSVChatApp:
             st.error(f"Error indexing data from {filename}: {str(e)}")
 
     def query_data(self, user_query: str) -> str:
-        """Query the data using OpenAI and LangChain"""
+        """Optimized query method using query preprocessing and adaptive search"""
+        start_time = time.time()
+        
         if not self.dfs and not self.text_files:
             return "Please upload at least one CSV file or text document first."
 
@@ -414,161 +626,401 @@ class CSVChatApp:
             st.error("LangChain vectorstore is None. Please try uploading your files again.")
             return "Please upload a CSV file or text document first to initialize the search index."
 
-        # Check if query requires aggregation
-        query_lower = user_query.lower()
-        aggregation_keywords = ['sum', 'total', 'average', 'mean', 'count', 'aggregate', 'group by']
-        requires_aggregation = any(keyword in query_lower for keyword in aggregation_keywords)
+        # Generate query hash for caching
+        query_hash = hashlib.md5(user_query.encode()).hexdigest()
+        
+        # Check cache first
+        cached_result = self.query_optimizer.get_cached_result(query_hash)
+        if cached_result:
+            cache_time = time.time() - start_time
+            self._record_performance_metrics(query_hash, 'cache_hit', cache_time)
+            st.info(f"Returning cached result (retrieved in {cache_time:.2f}s)")
+            return cached_result
 
+        # Preprocess and optimize the query
+        preprocessing_start = time.time()
+        query_analysis = self.query_optimizer.preprocess_query(user_query)
+        preprocessing_time = time.time() - preprocessing_start
+        
+        # Get adaptive search parameters
+        k = self.query_optimizer.get_adaptive_k(query_analysis['complexity'], query_analysis['intent'])
+        
+        # Perform optimized search
         try:
-            # Search for relevant data using LangChain
-            docs = self.vectorstore.similarity_search(user_query, k=10)
+            search_start = time.time()
+            search_strategy = query_analysis['strategy']
+            search_method = self.query_optimizer.search_strategies[search_strategy]
+            docs = search_method(self.vectorstore, query_analysis['processed_query'], k)
+            search_time = time.time() - search_start
             
             if not docs:
                 return "No relevant data found. Please make sure your files were processed successfully."
 
-            # Process LangChain documents
-            relevant_data = []
-            for doc in docs:
-                metadata = doc.metadata
-                if metadata and 'filename' in metadata:
-                    filename = metadata['filename']
-                    
-                    # Handle data rows (CSV or Excel)
-                    if 'row_index' in metadata and filename in self.dfs:
-                        try:
-                            row_idx = metadata['row_index']
-                            row_data = self.dfs[filename].iloc[row_idx]
-                            
-                            # Determine data type and add sheet info if available
-                            data_type = 'csv_row' if 'sheet_name' not in metadata else 'excel_row'
-                            relevant_data.append({
-                                'filename': filename,
-                                'type': data_type,
-                                'data': row_data,
-                                'sheet_name': metadata.get('sheet_name', None),
-                                'original_file': metadata.get('original_file', filename),
-                                'content': doc.page_content
-                            })
-                        except Exception as row_error:
-                            st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
-                            continue
-                    
-                    # Handle text data
-                    elif 'content_type' in metadata and metadata['content_type'] == 'text_chunk':
+            # Process documents with optimized context building
+            processing_start = time.time()
+            relevant_data = self._process_search_results(docs)
+            processing_time = time.time() - processing_start
+            
+            # Build optimized context
+            context_start = time.time()
+            context = self._build_optimized_context(query_analysis, relevant_data)
+            context_time = time.time() - context_start
+            
+            # Generate response
+            response_start = time.time()
+            response = self._generate_response(context, user_query)
+            response_time = time.time() - response_start
+            
+            # Cache the result
+            self.query_optimizer.cache_query_result(query_hash, response)
+            
+            # Record performance metrics
+            total_time = time.time() - start_time
+            self._record_performance_metrics(query_hash, 'full_query', total_time, {
+                'preprocessing_time': preprocessing_time,
+                'search_time': search_time,
+                'processing_time': processing_time,
+                'context_time': context_time,
+                'response_time': response_time,
+                'strategy': search_strategy,
+                'k': k,
+                'docs_found': len(docs),
+                'complexity': query_analysis['complexity']
+            })
+            
+            # Add to query history for pattern analysis
+            self.query_history.append({
+                'query': user_query,
+                'strategy': search_strategy,
+                'complexity': query_analysis['complexity'],
+                'execution_time': total_time,
+                'timestamp': time.time()
+            })
+            
+            return response
+            
+        except Exception as e:
+            error_time = time.time() - start_time
+            self._record_performance_metrics(query_hash, 'error', error_time)
+            st.error(f"Error in optimized query: {str(e)}")
+            return f"Error processing query: {str(e)}"
+    
+    def _record_performance_metrics(self, query_hash: str, query_type: str, execution_time: float, details: Dict[str, Any] = None):
+        """Record performance metrics for analysis"""
+        if query_hash not in self.performance_metrics:
+            self.performance_metrics[query_hash] = []
+        
+        metric = {
+            'type': query_type,
+            'execution_time': execution_time,
+            'timestamp': time.time()
+        }
+        
+        if details:
+            metric.update(details)
+        
+        self.performance_metrics[query_hash].append(metric)
+    
+    def get_performance_insights(self) -> Dict[str, Any]:
+        """Get insights about query performance for optimization"""
+        if not self.performance_metrics:
+            return {"message": "No performance data available yet"}
+        
+        insights = {
+            'total_queries': len(self.performance_metrics),
+            'cache_hit_rate': 0,
+            'average_execution_time': 0,
+            'strategy_performance': {},
+            'complexity_distribution': {},
+            'slowest_queries': []
+        }
+        
+        total_queries = 0
+        cache_hits = 0
+        total_time = 0
+        strategy_times = {}
+        complexity_counts = {}
+        
+        for query_hash, metrics in self.performance_metrics.items():
+            for metric in metrics:
+                total_queries += 1
+                total_time += metric['execution_time']
+                
+                if metric['type'] == 'cache_hit':
+                    cache_hits += 1
+                
+                if 'strategy' in metric:
+                    strategy = metric['strategy']
+                    if strategy not in strategy_times:
+                        strategy_times[strategy] = []
+                    strategy_times[strategy].append(metric['execution_time'])
+                
+                if 'complexity' in metric:
+                    complexity = metric['complexity']
+                    complexity_counts[complexity] = complexity_counts.get(complexity, 0) + 1
+        
+        if total_queries > 0:
+            insights['cache_hit_rate'] = cache_hits / total_queries
+            insights['average_execution_time'] = total_time / total_queries
+        
+        # Strategy performance
+        for strategy, times in strategy_times.items():
+            insights['strategy_performance'][strategy] = {
+                'count': len(times),
+                'average_time': sum(times) / len(times),
+                'min_time': min(times),
+                'max_time': max(times)
+            }
+        
+        # Complexity distribution
+        insights['complexity_distribution'] = complexity_counts
+        
+        # Find slowest queries
+        all_queries = []
+        for query_hash, metrics in self.performance_metrics.items():
+            for metric in metrics:
+                if metric['type'] == 'full_query':
+                    all_queries.append((query_hash, metric['execution_time']))
+        
+        all_queries.sort(key=lambda x: x[1], reverse=True)
+        insights['slowest_queries'] = all_queries[:5]
+        
+        return insights
+    
+    def display_performance_insights(self):
+        """Display performance insights in Streamlit"""
+        insights = self.get_performance_insights()
+        
+        if 'message' in insights:
+            st.info(insights['message'])
+            return
+        
+        st.subheader("🚀 Query Performance Insights")
+        
+        # Overall metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Queries", insights['total_queries'])
+        with col2:
+            st.metric("Cache Hit Rate", f"{insights['cache_hit_rate']:.1%}")
+        with col3:
+            st.metric("Avg Execution Time", f"{insights['average_execution_time']:.2f}s")
+        
+        # Strategy performance
+        if insights['strategy_performance']:
+            st.subheader("📊 Search Strategy Performance")
+            strategy_data = []
+            for strategy, perf in insights['strategy_performance'].items():
+                strategy_data.append({
+                    'Strategy': strategy,
+                    'Count': perf['count'],
+                    'Avg Time (s)': f"{perf['average_time']:.2f}",
+                    'Min Time (s)': f"{perf['min_time']:.2f}",
+                    'Max Time (s)': f"{perf['max_time']:.2f}"
+                })
+            
+            strategy_df = pd.DataFrame(strategy_data)
+            st.dataframe(strategy_df, use_container_width=True)
+        
+        # Complexity distribution
+        if insights['complexity_distribution']:
+            st.subheader("🎯 Query Complexity Distribution")
+            complexity_df = pd.DataFrame([
+                {'Complexity': k, 'Count': v} 
+                for k, v in insights['complexity_distribution'].items()
+            ])
+            st.dataframe(complexity_df, use_container_width=True)
+        
+        # Slowest queries
+        if insights['slowest_queries']:
+            st.subheader("🐌 Slowest Queries")
+            slow_queries_df = pd.DataFrame([
+                {'Query Hash': qh[:8] + '...', 'Execution Time (s)': f"{time:.2f}"}
+                for qh, time in insights['slowest_queries']
+            ])
+            st.dataframe(slow_queries_df, use_container_width=True)
+    
+    def get_query_optimization_recommendations(self) -> List[str]:
+        """Get recommendations for further query optimization"""
+        insights = self.get_performance_insights()
+        recommendations = []
+        
+        if 'message' in insights:
+            return ["Run some queries first to get optimization recommendations"]
+        
+        # Cache hit rate recommendations
+        if insights['cache_hit_rate'] < 0.2:
+            recommendations.append("🔧 Consider increasing cache TTL or implementing query similarity caching")
+        
+        # Strategy recommendations
+        if insights['strategy_performance']:
+            slowest_strategy = min(insights['strategy_performance'].items(), 
+                                 key=lambda x: x[1]['average_time'])
+            fastest_strategy = max(insights['strategy_performance'].items(), 
+                                 key=lambda x: x[1]['average_time'])
+            
+            if slowest_strategy[1]['average_time'] > fastest_strategy[1]['average_time'] * 2:
+                recommendations.append(f"⚡ {slowest_strategy[0]} strategy is significantly slower than {fastest_strategy[0]}. Consider optimizing query routing.")
+        
+        # Complexity recommendations
+        if insights['complexity_distribution'].get('high', 0) > insights['complexity_distribution'].get('low', 0):
+            recommendations.append("🎯 High complexity queries are common. Consider query simplification or better preprocessing.")
+        
+        # General recommendations
+        if insights['average_execution_time'] > 5.0:
+            recommendations.append("⏱️ Average query time is high. Consider implementing more aggressive caching or query optimization.")
+        
+        if not recommendations:
+            recommendations.append("✅ Query performance looks good! No immediate optimizations needed.")
+        
+        return recommendations
+
+    def _process_search_results(self, docs: List) -> List[Dict[str, Any]]:
+        """Process search results with error handling"""
+        relevant_data = []
+        
+        for doc in docs:
+            metadata = doc.metadata
+            if metadata and 'filename' in metadata:
+                filename = metadata['filename']
+                
+                # Handle data rows (CSV or Excel)
+                if 'row_index' in metadata and filename in self.dfs:
+                    try:
+                        row_idx = metadata['row_index']
+                        row_data = self.dfs[filename].iloc[row_idx]
+                        
+                        data_type = 'csv_row' if 'sheet_name' not in metadata else 'excel_row'
                         relevant_data.append({
                             'filename': filename,
-                            'type': 'text_chunk',
-                            'data': doc.page_content,
+                            'type': data_type,
+                            'data': row_data,
+                            'sheet_name': metadata.get('sheet_name', None),
+                            'original_file': metadata.get('original_file', filename),
                             'content': doc.page_content
                         })
-        except Exception as e:
-            st.error(f"Error searching data: {str(e)}")
-            return f"Error searching data: {str(e)}"
-
-        # Create context for OpenAI
+                    except Exception as row_error:
+                        st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
+                        continue
+                
+                # Handle text data
+                elif 'content_type' in metadata and metadata['content_type'] == 'text_chunk':
+                    relevant_data.append({
+                        'filename': filename,
+                        'type': 'text_chunk',
+                        'data': doc.page_content,
+                        'content': doc.page_content
+                    })
+        
+        return relevant_data
+    
+    def _build_optimized_context(self, query_analysis: Dict[str, Any], relevant_data: List[Dict[str, Any]]) -> str:
+        """Build optimized context based on query analysis"""
         context_parts = []
         
-        # If aggregation is needed, perform it first
-        aggregation_results = ""
-        if requires_aggregation:
-            aggregation_results = self.perform_aggregation(user_query)
+        # Add aggregation results if needed
+        if query_analysis['requires_aggregation']:
+            aggregation_results = self.perform_aggregation(query_analysis['original_query'])
+            if aggregation_results:
+                context_parts.append(f"Aggregation Results: {aggregation_results}")
         
-        # Add cross-dataset insights
-        cross_dataset_insights = self.generate_cross_dataset_insights(user_query)
+        # Add cross-dataset insights if needed
+        if query_analysis['requires_cross_dataset']:
+            cross_dataset_insights = self.generate_cross_dataset_insights(query_analysis['original_query'])
+            if cross_dataset_insights:
+                context_parts.append(f"Cross-Dataset Insights: {cross_dataset_insights}")
         
-        # Add information about all loaded datasets
-        for filename, df in self.dfs.items():
-            # Check if this is a sheet-specific filename (contains underscore and not a file extension)
-            if "_" in filename and not filename.endswith('.csv') and not filename.endswith('.xlsx'):
-                # This is a sheet from an Excel file
-                parts = filename.split("_", 1)
-                original_file = parts[0]
-                sheet_name = parts[1]
-                
-                context_parts.append(f"""
-                Dataset: {filename}
-                Type: Excel Sheet
-                Original File: {original_file}
-                Sheet Name: {sheet_name}
-                Total Rows: {len(df)}
-                Columns: {list(df.columns)}
-                Sample Data (first 3 rows):
-                {df.head(3).to_string()}
-                """)
-            else:
-                # This is a regular CSV or single-sheet Excel file
-                file_type = "Excel" if filename.endswith(('.xlsx', '.xls')) else "CSV"
-                context_parts.append(f"""
-                Dataset: {filename}
-                Type: {file_type}
-                Columns: {list(df.columns)}
-                Total Rows: {len(df)}
-                Sample Data (first 3 rows):
-                {df.head(3).to_string()}
-                """)
-        
-        # Add information about text files
-        for filename in self.text_files:
-            context_parts.append(f"""
-            Document: {filename}
-            Type: Text Document
-            Status: Indexed in vector database
-            """)
+        # Add dataset summaries (cached)
+        dataset_summaries = self._get_dataset_summaries()
+        if dataset_summaries:
+            context_parts.append(f"Available Datasets:\n{dataset_summaries}")
         
         # Add relevant data found
         if relevant_data:
-            relevant_data_parts = []
-            for item in relevant_data:
-                if item['type'] == 'csv_row':
-                    relevant_data_parts.append(f"""
+            relevant_data_text = self._format_relevant_data(relevant_data)
+            context_parts.append(f"Relevant Data for Query:\n{relevant_data_text}")
+        else:
+            context_parts.append("No relevant data found")
+        
+        return "\n\n".join(context_parts)
+    
+    def _get_dataset_summaries(self) -> str:
+        """Get cached dataset summaries"""
+        if not self.dataset_summaries:
+            summaries = []
+            for filename, df in self.dfs.items():
+                if "_" in filename and not filename.endswith(('.csv', '.xlsx')):
+                    # Excel sheet
+                    parts = filename.split("_", 1)
+                    original_file = parts[0]
+                    sheet_name = parts[1]
+                    summaries.append(f"""
+                    Dataset: {filename}
+                    Type: Excel Sheet
+                    Original File: {original_file}
+                    Sheet Name: {sheet_name}
+                    Total Rows: {len(df)}
+                    Columns: {list(df.columns)}
+                    """)
+                else:
+                    # Regular file
+                    file_type = "Excel" if filename.endswith(('.xlsx', '.xls')) else "CSV"
+                    summaries.append(f"""
+                    Dataset: {filename}
+                    Type: {file_type}
+                    Columns: {list(df.columns)}
+                    Total Rows: {len(df)}
+                    """)
+            
+            # Add text files
+            for filename in self.text_files:
+                summaries.append(f"""
+                Document: {filename}
+                Type: Text Document
+                Status: Indexed in vector database
+                """)
+            
+            self.dataset_summaries = "\n".join(summaries)
+        
+        return self.dataset_summaries
+    
+    def _format_relevant_data(self, relevant_data: List[Dict[str, Any]]) -> str:
+        """Format relevant data for context"""
+        formatted_parts = []
+        
+        for item in relevant_data:
+            if item['type'] == 'csv_row':
+                formatted_parts.append(f"""
                 From CSV file {item['filename']}:
                 {item['data'].to_string()}
-                LangChain content: {item.get('content', 'N/A')}
                 """)
-                elif item['type'] == 'excel_row':
-                    sheet_info = f" (Sheet: {item['sheet_name']})" if item['sheet_name'] else ""
-                    original_file = item.get('original_file', item['filename'])
-                    relevant_data_parts.append(f"""
+            elif item['type'] == 'excel_row':
+                sheet_info = f" (Sheet: {item['sheet_name']})" if item['sheet_name'] else ""
+                original_file = item.get('original_file', item['filename'])
+                formatted_parts.append(f"""
                 From Excel file {original_file}{sheet_info}:
                 {item['data'].to_string()}
-                LangChain content: {item.get('content', 'N/A')}
                 """)
-                elif item['type'] == 'text_chunk':
-                    relevant_data_parts.append(f"""
+            elif item['type'] == 'text_chunk':
+                formatted_parts.append(f"""
                 From text document {item['filename']}:
                 {item['data']}
                 """)
-            relevant_data_text = "\n".join(relevant_data_parts)
-        else:
-            relevant_data_text = "No relevant data found"
         
-        context = f"""
-        Available Datasets:
-        {chr(10).join(context_parts)}
-        
-        {f"Aggregation Results: {aggregation_results}" if aggregation_results else ""}
-        
-        {f"Cross-Dataset Insights: {cross_dataset_insights}" if cross_dataset_insights else ""}
-        
-        Relevant Data for Query:
-        {relevant_data_text}
-        
-        User Query: {user_query}
-        
-        Please provide a helpful response based on this data. Consider the holistic view of all datasets,
-        their relationships, and patterns. If the query asks for analysis, provide comprehensive insights
-        that span across the entire dataset. If it asks for specific data, provide the relevant information
-        with context about how it fits into the broader picture. Be conversational and helpful.
-        """
-
+        return "\n".join(formatted_parts)
+    
+    def _generate_response(self, context: str, user_query: str) -> str:
+        """Generate response using OpenAI with optimized context"""
         try:
-            response = client.chat.completions.create(model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful data analyst assistant. The data you are looking at is advertising spend data related to marketing campaigns. Sometimes the data is spread across multiple sheets. Your job is to indentify helpful information and insights across all of the sheets. When there are multiple sheets, consider information from all of the sheets before giving a response"},
-                {"role": "user", "content": context}
-            ],
-            max_tokens=1500,
-            temperature=0.7)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a helpful data analyst assistant. The data you are looking at is advertising spend data related to marketing campaigns. Sometimes the data is spread across multiple sheets. Your job is to identify helpful information and insights across all of the sheets. When there are multiple sheets, consider information from all of the sheets before giving a response. Be concise and focused on the specific query."},
+                    {"role": "user", "content": f"{context}\n\nUser Query: {user_query}"}
+                ],
+                max_tokens=1500,
+                temperature=0.7
+            )
             return response.choices[0].message.content
         except Exception as e:
             return f"Error generating response: {str(e)}"
