@@ -210,7 +210,8 @@ class QueryOptimizer:
         elif intent.get('filtering'):
             k = min(k, 8)  # More focused results for filtering
         
-        return k
+        # Ensure k is an integer
+        return int(k)
     
     def cache_query_result(self, query_hash: str, result: Any, ttl: int = 300):
         """Cache query result with TTL"""
@@ -1266,46 +1267,41 @@ class CSVChatApp:
         df_name = intent['datasets'][0] if intent['datasets'] else list(self.dfs.keys())[0]
         df = self.dfs[df_name]
         
-        # Handle grouping
-        if 'group_by' in intent['parameters']:
+        # Validate columns exist
+        for col in intent['columns']:
+            if col not in df.columns:
+                st.error(f"Column '{col}' not found in dataset '{df_name}'. Available columns: {list(df.columns)}")
+                return None
+        
+        # Handle grouping with LLM-extracted parameters
+        if intent['parameters'].get('group_by') and intent['parameters']['group_by'] != 'null':
             group_col = intent['parameters']['group_by']
-            # Find the actual column name that matches
-            group_col_actual = None
-            for col in df.columns:
-                if group_col in col.lower() or col.lower() in group_col:
-                    group_col_actual = col
-                    break
             
-            if group_col_actual and intent['columns']:
-                value_col = intent['columns'][0]
-                
-                # Check if columns exist
-                if value_col not in df.columns:
-                    st.error(f"Column '{value_col}' not found in dataset. Available columns: {list(df.columns)}")
-                    return None
-                
-                if group_col_actual not in df.columns:
-                    st.error(f"Column '{group_col_actual}' not found in dataset. Available columns: {list(df.columns)}")
-                    return None
+            # Use the exact column name from LLM parsing
+            if group_col in df.columns:
+                value_col = intent['columns'][0] if intent['columns'] else df.columns[0]
                 
                 try:
-                    # Aggregate if needed
-                    if intent['parameters'].get('aggregation') == 'mean':
-                        data = df.groupby(group_col_actual)[value_col].mean().reset_index()
-                    elif intent['parameters'].get('aggregation') == 'sum':
-                        data = df.groupby(group_col_actual)[value_col].sum().reset_index()
+                    # Aggregate based on LLM-extracted aggregation type
+                    aggregation = intent['parameters'].get('aggregation', 'count')
+                    if aggregation == 'mean':
+                        data = df.groupby(group_col)[value_col].mean().reset_index()
+                    elif aggregation == 'sum':
+                        data = df.groupby(group_col)[value_col].sum().reset_index()
+                    elif aggregation == 'count':
+                        data = df.groupby(group_col)[value_col].count().reset_index()
                     else:
-                        data = df.groupby(group_col_actual)[value_col].count().reset_index()
+                        data = df.groupby(group_col)[value_col].count().reset_index()
                     
-                    fig = px.bar(data, x=group_col_actual, y=value_col,
-                               title=f"{value_col} by {group_col_actual}")
+                    fig = px.bar(data, x=group_col, y=value_col,
+                               title=f"{aggregation.title()} of {value_col} by {group_col}")
                     return fig
                 except Exception as e:
-                    st.error(f"Error creating chart: {str(e)}")
+                    st.error(f"Error creating grouped bar chart: {str(e)}")
                     return None
         
-        # Simple bar chart of first column
-        if intent['columns']:
+        # Simple bar chart - use first column as x-axis
+        if len(intent['columns']) >= 1:
             col = intent['columns'][0]
             fig = px.bar(df, x=col, title=f"Distribution of {col}")
             return fig
@@ -1397,13 +1393,80 @@ class CSVChatApp:
         return fig
 
     def parse_visualization_intent(self, query: str):
+        """Parse visualization intent using LLM for better accuracy"""
+        try:
+            # Get available columns from all datasets
+            available_columns = {}
+            for df_name, df in self.dfs.items():
+                available_columns[df_name] = list(df.columns)
+            
+            # Use LLM to parse the entire visualization intent
+            prompt = f"""
+            Parse this visualization query: "{query}"
+            
+            Available datasets and columns:
+            {json.dumps(available_columns, indent=2)}
+            
+            Return ONLY a JSON object with:
+            {{
+                "chart_type": "bar|line|scatter|pie|histogram|box",
+                "columns": ["column_name1", "column_name2"],
+                "datasets": ["dataset_name"],
+                "parameters": {{
+                    "aggregation": "sum|mean|count|null",
+                    "group_by": "column_name|null"
+                }}
+            }}
+            
+            Rules:
+            - chart_type: Choose the most appropriate chart type based on the query
+            - columns: Match exact column names from available columns
+            - datasets: Choose the most relevant dataset(s)
+            - aggregation: Extract if query mentions sum/average/count
+            - group_by: Extract grouping column if query mentions "by" or "group by"
+            - Return only the JSON, no other text
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                temperature=0.1
+            )
+            
+            # Parse the JSON response
+            response_text = response.choices[0].message.content.strip()
+            
+            # Extract JSON from response
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            if json_start != -1 and json_end != 0:
+                json_str = response_text[json_start:json_end]
+                parsed = json.loads(json_str)
+                
+                return {
+                    'chart_type': parsed.get('chart_type'),
+                    'columns': parsed.get('columns', []),
+                    'datasets': parsed.get('datasets', []),
+                    'parameters': parsed.get('parameters', {})
+                }
+            else:
+                # Fallback to original method
+                return self._fallback_parse_visualization_intent(query)
+                
+        except Exception as e:
+            st.warning(f"LLM visualization parsing failed: {str(e)}. Using fallback method.")
+            return self._fallback_parse_visualization_intent(query)
+    
+    def _fallback_parse_visualization_intent(self, query: str):
+        """Fallback visualization intent parsing"""
         query_lower = query.lower()
         
         # Step 1: Detect chart type
         chart_type = self.detect_chart_type(query_lower)
         
         # Step 2: Extract columns and datasets
-        columns, datasets = self.extract_columns_and_datasets(query_lower)
+        columns, datasets = self._fallback_column_extraction(query_lower)
         
         # Step 3: Extract additional parameters
         params = self.extract_chart_parameters(query_lower)
@@ -1431,6 +1494,63 @@ class CSVChatApp:
         return None
 
     def extract_columns_and_datasets(self, query: str):
+        """Use LLM to intelligently match columns"""
+        try:
+            # Get available columns from all datasets
+            available_columns = {}
+            for df_name, df in self.dfs.items():
+                available_columns[df_name] = list(df.columns)
+            
+            # Use LLM to parse the query
+            prompt = f"""
+            Parse this visualization query: "{query}"
+            
+            Available datasets and columns:
+            {json.dumps(available_columns, indent=2)}
+            
+            Return ONLY a JSON object with:
+            {{
+                "columns": ["column_name1", "column_name2"],
+                "datasets": ["dataset_name"],
+                "chart_type": "bar|line|scatter|pie|histogram|box"
+            }}
+            
+            Rules:
+            - Match column names exactly as they appear in the available columns
+            - Choose the most relevant columns for the query
+            - If query mentions specific columns, use those
+            - If query is vague, choose numeric columns for y-axis and categorical for x-axis
+            - Return only the JSON, no other text
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0.1
+            )
+            
+            # Parse the JSON response
+            response_text = response.choices[0].message.content.strip()
+            
+            # Extract JSON from response (in case there's extra text)
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            if json_start != -1 and json_end != 0:
+                json_str = response_text[json_start:json_end]
+                parsed = json.loads(json_str)
+                
+                return parsed.get('columns', []), parsed.get('datasets', [])
+            else:
+                # Fallback if JSON parsing fails
+                return self._fallback_column_extraction(query)
+                
+        except Exception as e:
+            st.warning(f"LLM column extraction failed: {str(e)}. Using fallback method.")
+            return self._fallback_column_extraction(query)
+    
+    def _fallback_column_extraction(self, query: str):
+        """Fallback column extraction method"""
         columns = []
         datasets = []
         
@@ -1729,17 +1849,16 @@ def main():
                     response = app.query_data(prompt)
                     st.markdown(response)
 
-                    # Generate visualization if appropriate
-                    viz = app.generate_visualization(prompt)
-                    if viz:
-                        st.subheader("📊 Generated Visualization")
-                        st.plotly_chart(viz, use_container_width=True)
-                        st.caption(f"Chart type: {app.parse_visualization_intent(prompt)['chart_type']}")
-                    else:
-                        # Debug info
-                        intent = app.parse_visualization_intent(prompt)
-                        if intent['chart_type']:
-                            st.info(f"Debug: Chart type detected: {intent['chart_type']}, Columns: {intent['columns']}, Parameters: {intent['parameters']}")
+                    # Generate visualization only if explicitly requested
+                    viz_keywords = ['create visualization', 'create chart', 'create graph', 'show chart', 'show graph', 'plot', 'visualize', 'chart', 'graph']
+                    if any(keyword in prompt.lower() for keyword in viz_keywords):
+                        viz = app.generate_visualization(prompt)
+                        if viz:
+                            st.subheader("📊 Generated Visualization")
+                            st.plotly_chart(viz, use_container_width=True)
+                            st.caption(f"Chart type: {app.parse_visualization_intent(prompt)['chart_type']}")
+                        else:
+                            st.info("Could not generate visualization. Please check your data and try again.")
 
             # Add assistant response to chat history
             st.session_state.messages.append({"role": "assistant", "content": response})
