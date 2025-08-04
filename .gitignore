@@ -12,3 +12,4 @@ wheels/
 chroma_db/
 data/
 files/
+.DS_Store
