@@ -13,6 +13,12 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import re
 
+# LangChain imports
+from langchain_community.document_loaders import CSVLoader, UnstructuredExcelLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+
 # Load environment variables
 load_dotenv()
 
@@ -24,42 +30,55 @@ class CSVChatApp:
         self.dfs = {}  # Dictionary to store multiple dataframes
         self.text_files = set()  # Set to track uploaded text files
         self.text_contents = {}  # Dictionary to store original text content
-        self.chroma_client = None
-        self.collection = None
+        self.vectorstore = None  # LangChain vectorstore
+        self.embeddings = None  # OpenAI embeddings
+        self.text_splitter = None  # Text splitter
         self.chat_history = []
         self.processed_files = set()  # Set to track processed file names
 
-    def setup_chroma(self):
-        """Initialize ChromaDB for vector storage"""
+    def setup_langchain(self):
+        """Initialize LangChain components for vector storage"""
         try:
-            if self.chroma_client is None:
-                # Use persistent storage to avoid context leaks
-                self.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+            if self.embeddings is None:
+                self.embeddings = OpenAIEmbeddings()
+            
+            if self.text_splitter is None:
+                self.text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                    length_function=len,
+                    separators=["\n\n", "\n", " ", ""]
+                )
+            
+            # Initialize vectorstore if not exists
+            if self.vectorstore is None:
+                # Use persistent ChromaDB with LangChain
+                self.vectorstore = Chroma(
+                    persist_directory="./chroma_db",
+                    embedding_function=self.embeddings,
+                    collection_name="csv_data"
+                )
                 
-            # Delete existing collection if it exists (to avoid metadata format issues)
-            try:
-                self.chroma_client.delete_collection(name="csv_data")
-            except:
-                pass  # Collection doesn't exist, which is fine
-                
-            # Create new collection
-            self.collection = self.chroma_client.create_collection(
-                name="csv_data",
-                metadata={"description": "CSV data for semantic search"}
-            )
         except Exception as e:
-            st.error(f"Error setting up ChromaDB: {str(e)}")
-            self.chroma_client = None
-            self.collection = None
+            st.error(f"Error setting up LangChain: {str(e)}")
+            self.embeddings = None
+            self.text_splitter = None
+            self.vectorstore = None
 
     def process_csv(self, uploaded_file, filename: str) -> pd.DataFrame:
-        """Process uploaded CSV file"""
+        """Process uploaded CSV file using LangChain"""
         try:
+            # Read CSV with pandas for dataframe storage
             df = pd.read_csv(uploaded_file)
             self.dfs[filename] = df
-            self.processed_files.add(filename)  # Mark as processed
-            self.setup_chroma()
-            self.index_data(filename, df)
+            self.processed_files.add(filename)
+            
+            # Setup LangChain components
+            self.setup_langchain()
+            
+            # Process with LangChain CSVLoader
+            self.process_with_langchain(uploaded_file, filename, "csv")
+            
             return df
         except Exception as e:
             st.error(f"Error processing CSV: {str(e)}")
@@ -76,16 +95,16 @@ class CSVChatApp:
                 # Single sheet - read directly
                 df = pd.read_excel(uploaded_file)
                 self.dfs[filename] = df
-                self.processed_files.add(filename)  # Mark as processed
-                self.setup_chroma()
-                self.index_data(filename, df)
+                self.processed_files.add(filename)
+                self.setup_langchain()
+                self.process_excel_sheet_with_langchain(df, filename)
                 return df
             else:
                 # Multiple sheets - process each sheet separately
                 st.info(f"Excel file '{filename}' contains {len(sheet_names)} sheets: {sheet_names}")
                 
-                # Setup ChromaDB once for all sheets
-                self.setup_chroma()
+                # Setup LangChain once for all sheets
+                self.setup_langchain()
                 
                 # Process each sheet separately
                 processed_sheets = []
@@ -100,8 +119,8 @@ class CSVChatApp:
                             self.dfs[sheet_filename] = df
                             self.processed_files.add(sheet_filename)  # Mark as processed
                             
-                            # Index this sheet separately
-                            self.index_data(sheet_filename, df)
+                            # Process this sheet with LangChain
+                            self.process_excel_sheet_with_langchain(df, sheet_filename)
                             
                             processed_sheets.append(sheet_name)
                             total_rows += len(df)
@@ -130,6 +149,103 @@ class CSVChatApp:
             st.error(f"Error processing Excel file: {str(e)}")
             return None
 
+    def process_with_langchain(self, uploaded_file, filename: str, file_type: str):
+        """Process files using LangChain loaders"""
+        try:
+            if file_type == "csv":
+                # Save uploaded file temporarily
+                temp_path = f"temp_{filename}"
+                with open(temp_path, 'wb') as f:
+                    f.write(uploaded_file.read())
+                
+                # Load with LangChain CSVLoader
+                loader = CSVLoader(temp_path)
+                documents = loader.load()
+                
+                # Add metadata to documents
+                for doc in documents:
+                    doc.metadata.update({
+                        "filename": filename,
+                        "file_type": "csv",
+                        "content_type": "data_row"
+                    })
+                
+                # Split documents
+                chunks = self.text_splitter.split_documents(documents)
+                
+                # Add to vectorstore
+                self.vectorstore.add_documents(chunks)
+                
+                # Clean up temp file
+                os.remove(temp_path)
+                
+                st.success(f"Processed {len(chunks)} chunks from {filename} with LangChain")
+                
+        except Exception as e:
+            st.error(f"Error processing {filename} with LangChain: {str(e)}")
+
+    def process_excel_sheet_with_langchain(self, df: pd.DataFrame, filename: str):
+        """Process Excel sheet data with LangChain"""
+        try:
+            # Convert dataframe to documents
+            documents = []
+            for idx, row in df.iterrows():
+                # Create document from row
+                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                doc = type('Document', (), {
+                    'page_content': row_text,
+                    'metadata': {
+                        'filename': filename,
+                        'row_index': idx,
+                        'file_type': 'excel',
+                        'content_type': 'data_row'
+                    }
+                })()
+                documents.append(doc)
+            
+            # Split documents
+            chunks = self.text_splitter.split_documents(documents)
+            
+            # Add to vectorstore
+            self.vectorstore.add_documents(chunks)
+            
+            st.success(f"Processed {len(chunks)} chunks from {filename} with LangChain")
+            
+        except Exception as e:
+            st.error(f"Error processing Excel sheet {filename} with LangChain: {str(e)}")
+
+    def process_text_with_langchain(self, text_content: str, filename: str):
+        """Process text content with LangChain"""
+        try:
+            # Create document from text content
+            doc = type('Document', (), {
+                'page_content': text_content,
+                'metadata': {
+                    'filename': filename,
+                    'file_type': 'text',
+                    'content_type': 'text'
+                }
+            })()
+            
+            # Split document
+            chunks = self.text_splitter.split_documents([doc])
+            
+            # Add metadata to chunks
+            for chunk in chunks:
+                chunk.metadata.update({
+                    'filename': filename,
+                    'file_type': 'text',
+                    'content_type': 'text_chunk'
+                })
+            
+            # Add to vectorstore
+            self.vectorstore.add_documents(chunks)
+            
+            st.success(f"Processed {len(chunks)} text chunks from {filename} with LangChain")
+            
+        except Exception as e:
+            st.error(f"Error processing text {filename} with LangChain: {str(e)}")
+
     def process_text_file(self, uploaded_file, filename: str) -> bool:
         """Process uploaded text file and add to vector database"""
         try:
@@ -139,11 +255,11 @@ class CSVChatApp:
             # Store original content for preview
             self.text_contents[filename] = text_content
             
-            # Setup ChromaDB if not already done
-            self.setup_chroma()
+            # Setup LangChain if not already done
+            self.setup_langchain()
             
-            # Index the text content
-            self.index_text_data(filename, text_content)
+            # Process text with LangChain
+            self.process_text_with_langchain(text_content, filename)
             
             # Track the uploaded text file
             self.text_files.add(filename)
@@ -290,12 +406,12 @@ class CSVChatApp:
             st.error(f"Error indexing data from {filename}: {str(e)}")
 
     def query_data(self, user_query: str) -> str:
-        """Query the data using OpenAI and ChromaDB"""
+        """Query the data using OpenAI and LangChain"""
         if not self.dfs and not self.text_files:
             return "Please upload at least one CSV file or text document first."
 
-        if self.collection is None:
-            st.error("ChromaDB collection is None. Please try uploading your files again.")
+        if self.vectorstore is None:
+            st.error("LangChain vectorstore is None. Please try uploading your files again.")
             return "Please upload a CSV file or text document first to initialize the search index."
 
         # Check if query requires aggregation
@@ -304,71 +420,47 @@ class CSVChatApp:
         requires_aggregation = any(keyword in query_lower for keyword in aggregation_keywords)
 
         try:
-            # Check if collection has any data
-            collection_count = self.collection.count()
-            if collection_count == 0:
-                return "No data has been indexed yet. Please make sure your files were processed successfully."
+            # Search for relevant data using LangChain
+            docs = self.vectorstore.similarity_search(user_query, k=10)
             
-            # Calculate total items (CSV rows + text chunks)
-            total_csv_rows = sum(len(df) for df in self.dfs.values())
-            total_items = max(collection_count, total_csv_rows, 1)  # Ensure at least 1
-            
-            # Search for relevant data - prioritize summary documents
-            results = self.collection.query(
-                query_texts=[user_query],
-                n_results=min(15, total_items),  # Get more results to filter
-                where={"content_type": "dataset_summary"}  # First get summaries
-            )
-            
-            # If no summary results, search for chunks
-            if not results['ids'] or not results['ids'][0]:
-                results = self.collection.query(
-                    query_texts=[user_query],
-                    n_results=min(10, total_items),
-                    where={"content_type": "data_chunk"}
-                )
+            if not docs:
+                return "No relevant data found. Please make sure your files were processed successfully."
 
-            # Get relevant data from all sources
+            # Process LangChain documents
             relevant_data = []
-            if results and 'metadatas' in results and results['metadatas'] and results['metadatas'][0]:
-                for i, metadata in enumerate(results['metadatas'][0]):
-                    if metadata and 'filename' in metadata:
-                        filename = metadata['filename']
-                        
-                        # Handle data rows (CSV or Excel)
-                        if 'row_index' in metadata and filename in self.dfs:
-                            try:
-                                row_idx = metadata['row_index']
-                                row_data = self.dfs[filename].iloc[row_idx]
-                                
-                                # Determine data type and add sheet info if available
-                                data_type = 'csv_row' if 'sheet_name' not in metadata else 'excel_row'
-                                relevant_data.append({
-                                    'filename': filename,
-                                    'type': data_type,
-                                    'data': row_data,
-                                    'sheet_name': metadata.get('sheet_name', None),
-                                    'original_file': metadata.get('original_file', filename)
-                                })
-                            except Exception as row_error:
-                                st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
-                                continue
-                        
-                        # Handle text data
-                        elif 'content_type' in metadata and metadata['content_type'] == 'text':
-                            try:
-                                # Get the actual text content from results
-                                if 'documents' in results and results['documents'] and i < len(results['documents'][0]):
-                                    text_content = results['documents'][0][i]
-                                    relevant_data.append({
-                                        'filename': filename,
-                                        'type': 'text_chunk',
-                                        'data': text_content,
-                                        'chunk_index': metadata.get('chunk_index', 'unknown')
-                                    })
-                            except Exception as text_error:
-                                st.warning(f"Error accessing text chunk from {filename}: {str(text_error)}")
-                                continue
+            for doc in docs:
+                metadata = doc.metadata
+                if metadata and 'filename' in metadata:
+                    filename = metadata['filename']
+                    
+                    # Handle data rows (CSV or Excel)
+                    if 'row_index' in metadata and filename in self.dfs:
+                        try:
+                            row_idx = metadata['row_index']
+                            row_data = self.dfs[filename].iloc[row_idx]
+                            
+                            # Determine data type and add sheet info if available
+                            data_type = 'csv_row' if 'sheet_name' not in metadata else 'excel_row'
+                            relevant_data.append({
+                                'filename': filename,
+                                'type': data_type,
+                                'data': row_data,
+                                'sheet_name': metadata.get('sheet_name', None),
+                                'original_file': metadata.get('original_file', filename),
+                                'content': doc.page_content
+                            })
+                        except Exception as row_error:
+                            st.warning(f"Error accessing row {row_idx} from {filename}: {str(row_error)}")
+                            continue
+                    
+                    # Handle text data
+                    elif 'content_type' in metadata and metadata['content_type'] == 'text_chunk':
+                        relevant_data.append({
+                            'filename': filename,
+                            'type': 'text_chunk',
+                            'data': doc.page_content,
+                            'content': doc.page_content
+                        })
         except Exception as e:
             st.error(f"Error searching data: {str(e)}")
             return f"Error searching data: {str(e)}"
@@ -431,6 +523,7 @@ class CSVChatApp:
                     relevant_data_parts.append(f"""
                 From CSV file {item['filename']}:
                 {item['data'].to_string()}
+                LangChain content: {item.get('content', 'N/A')}
                 """)
                 elif item['type'] == 'excel_row':
                     sheet_info = f" (Sheet: {item['sheet_name']})" if item['sheet_name'] else ""
@@ -438,10 +531,11 @@ class CSVChatApp:
                     relevant_data_parts.append(f"""
                 From Excel file {original_file}{sheet_info}:
                 {item['data'].to_string()}
+                LangChain content: {item.get('content', 'N/A')}
                 """)
                 elif item['type'] == 'text_chunk':
                     relevant_data_parts.append(f"""
-                From text document {item['filename']} (chunk {item['chunk_index']}):
+                From text document {item['filename']}:
                 {item['data']}
                 """)
             relevant_data_text = "\n".join(relevant_data_parts)
@@ -926,11 +1020,12 @@ class CSVChatApp:
 def main():
     st.set_page_config(
         page_title="ABI - Agentic Business Intelligence",
-        page_icon="abi_lime.png",
+        page_icon="assets/abi_lime.png",
         layout="wide"
     )
 
-    st.title("ABI - Agentic Business Intelligence")
+    # Just the logo as title
+    st.image("assets/abi_horiizontal_lime.png", width=450)
     st.markdown("Upload CSV, Excel files and text documents to chat with your data in natural language!")
 
     # Initialize app
