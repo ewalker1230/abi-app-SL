@@ -421,6 +421,8 @@ class CSVChatApp:
         try:
             if self.embeddings is None:
                 self.embeddings = OpenAIEmbeddings()
+                
+
             
             if self.text_splitter is None:
                 self.text_splitter = RecursiveCharacterTextSplitter(
@@ -535,31 +537,80 @@ class CSVChatApp:
             if file_type == "csv":
                 # Save uploaded file temporarily
                 temp_path = f"temp_{filename}"
+                
+                # Check if file has content
+                uploaded_file.seek(0)  # Reset to beginning
+                file_content = uploaded_file.read()
+                
+                if len(file_content) == 0:
+                    st.error(f"Uploaded file {filename} is empty. Please try uploading again.")
+                    return
+                
                 with open(temp_path, 'wb') as f:
-                    f.write(uploaded_file.read())
+                    f.write(file_content)
                 
-                # Load with LangChain CSVLoader
-                loader = CSVLoader(temp_path)
-                documents = loader.load()
+                # Debug info
+                st.info(f"Uploaded file size: {len(file_content)} bytes")
+                st.info(f"Temp file size: {os.path.getsize(temp_path)} bytes")
                 
-                # Add metadata to documents
-                for doc in documents:
-                    doc.metadata.update({
-                        "filename": filename,
-                        "file_type": "csv",
-                        "content_type": "data_row"
-                    })
+                # Reset file pointer for later use
+                uploaded_file.seek(0)
                 
-                # Split documents
-                chunks = self.text_splitter.split_documents(documents)
+
+                
+                # Load CSV with pandas and convert to documents
+                try:
+                    # Try reading with different encodings
+                    try:
+                        df = pd.read_csv(temp_path)
+                    except:
+                        df = pd.read_csv(temp_path, encoding='utf-8')
+                    
+                    if df.empty:
+                        st.error(f"CSV file {filename} is empty")
+                        return
+                except Exception as csv_error:
+                    st.error(f"Error reading CSV file {filename}: {str(csv_error)}")
+                    # Debug: show file content
+                    try:
+                        with open(temp_path, 'r') as f:
+                            content = f.read(500)
+                            st.error(f"File content preview: {repr(content)}")
+                    except:
+                        st.error("Could not read file content for debugging")
+                    return
+                
+                documents = []
+                
+                for idx, row in df.iterrows():
+                    # Create document from row - convert each row to text
+                    row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                    doc = type('Document', (), {
+                        'page_content': row_text,
+                        'metadata': {
+                            'filename': filename,
+                            'row_index': idx,
+                            'file_type': 'csv',
+                            'content_type': 'data_row'
+                        }
+                    })()
+                    documents.append(doc)
+                
+                st.info(f"Created {len(documents)} documents from {len(df)} CSV rows")
+                
+                # Use documents directly (no splitting needed for CSV)
+                chunks = documents
+                
+                # Use all chunks (don't filter)
+                valid_chunks = chunks
                 
                 # Add to vectorstore
-                self.vectorstore.add_documents(chunks)
+                self.vectorstore.add_documents(valid_chunks)
                 
                 # Clean up temp file
                 os.remove(temp_path)
                 
-                st.success(f"Processed {len(chunks)} chunks from {filename} with LangChain")
+                st.success(f"Processed {len(valid_chunks)} chunks from {filename} with LangChain")
                 
         except Exception as e:
             st.error(f"Error processing {filename} with LangChain: {str(e)}")
