@@ -407,6 +407,7 @@ class CSVChatApp:
         self.vectorstore = None  # LangChain vectorstore
         self.embeddings = None  # OpenAI embeddings
         self.text_splitter = None  # Text splitter
+        self.collection = None  # Direct ChromaDB collection
         self.chat_history = []
         self.processed_files = set()  # Set to track processed file names
         self.query_optimizer = QueryOptimizer()  # Query optimization system
@@ -415,37 +416,689 @@ class CSVChatApp:
         self.performance_metrics = {}  # Track query performance
         self.query_history = []  # Track query patterns for optimization
         self.session_manager = SessionManager()  # Session management with Redis
+        self.agent_insights = {}  # Store agent insights per session
 
     def setup_langchain(self):
         """Initialize LangChain components for vector storage"""
         try:
+            # Ensure chroma_db directory exists
+            import os
+            os.makedirs("./chroma_db", exist_ok=True)
+            
             if self.embeddings is None:
-                self.embeddings = OpenAIEmbeddings()
-                
-
+                try:
+                    self.embeddings = OpenAIEmbeddings()
+                except Exception as embed_error:
+                    st.error(f"Error initializing embeddings: {str(embed_error)}")
+                    st.error("Please check your OpenAI API key in the .env file")
+                    return
             
             if self.text_splitter is None:
                 self.text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200,
+                    chunk_size=500,
+                    chunk_overlap=50,
                     length_function=len,
-                    separators=["\n\n", "\n", " ", ""]
+                    separators=["\n\n", "\n", " ", ""],
+                    keep_separator=True
                 )
             
             # Initialize vectorstore if not exists
             if self.vectorstore is None:
-                # Use persistent ChromaDB with LangChain
-                self.vectorstore = Chroma(
-                    persist_directory="./chroma_db",
-                    embedding_function=self.embeddings,
-                    collection_name="csv_data"
-                )
+                try:
+                    self.vectorstore = Chroma(
+                        persist_directory="./chroma_db",
+                        embedding_function=self.embeddings,
+                        collection_name="csv_data"
+                    )
+                except Exception as db_error:
+                    # Only clear database if there's a database error
+                    if "Database error" in str(db_error) or "no such table" in str(db_error):
+                        st.warning("Database corrupted, clearing and recreating...")
+                        import shutil
+                        if os.path.exists("./chroma_db"):
+                            try:
+                                shutil.rmtree("./chroma_db")
+                            except:
+                                pass
+                        os.makedirs("./chroma_db", exist_ok=True)
+                        
+                        # Try again with fresh database
+                        self.vectorstore = Chroma(
+                            persist_directory="./chroma_db",
+                            embedding_function=self.embeddings,
+                            collection_name="csv_data"
+                        )
+                        st.success("Database recreated successfully!")
+                    else:
+                        # Re-raise other errors
+                        raise db_error
                 
         except Exception as e:
             st.error(f"Error setting up LangChain: {str(e)}")
             self.embeddings = None
             self.text_splitter = None
             self.vectorstore = None
+
+    def setup_chroma(self):
+        """Initialize ChromaDB collection for direct access"""
+        try:
+            import chromadb
+            from chromadb.config import Settings
+            
+            # Initialize ChromaDB client
+            client = chromadb.PersistentClient(
+                path="./chroma_db",
+                settings=Settings(
+                    anonymized_telemetry=False
+                )
+            )
+            
+            # Get or create collection
+            self.collection = client.get_or_create_collection(
+                name="csv_data",
+                metadata={"hnsw:space": "cosine"}
+            )
+            
+            # Clear existing data
+            self.collection.delete(where={})
+            
+            st.success("ChromaDB collection initialized and cleared")
+            
+        except Exception as e:
+            st.error(f"Error setting up ChromaDB: {str(e)}")
+            self.collection = None
+
+    def clear_vectorstore(self):
+        """Clear the LangChain vectorstore by recreating it"""
+        try:
+            # Clean up any existing chroma directories
+            import shutil
+            import os
+            
+            for item in os.listdir("."):
+                if item.startswith("chroma_db"):
+                    try:
+                        if os.path.isdir(item):
+                            shutil.rmtree(item)
+                        else:
+                            os.remove(item)
+                    except Exception as cleanup_error:
+                        st.warning(f"Could not clean up {item}: {str(cleanup_error)}")
+            
+            # Reset vectorstore
+            self.vectorstore = None
+            
+            # Recreate the vectorstore
+            self.setup_langchain()
+            
+            st.success("Vectorstore cleared and recreated")
+            
+        except Exception as e:
+            st.error(f"Error clearing vectorstore: {str(e)}")
+
+    def reset_session(self):
+        """Reset current session while keeping Redis records"""
+        try:
+            # Clear current session data
+            self.dfs.clear()
+            self.text_files.clear()
+            self.text_contents.clear()
+            self.processed_files.clear()
+            
+            # Clear current session agent insights
+            current_session_id = self.session_manager.get_or_create_session_id()
+            if current_session_id in self.agent_insights:
+                del self.agent_insights[current_session_id]
+            
+            # Clear vectorstore
+            self.clear_vectorstore()
+            
+            # Generate new session ID
+            new_session_id = self.session_manager.generate_session_id()
+            st.session_state.session_id = new_session_id
+            
+            st.success(f"Session reset! New session ID: {new_session_id[:8]}...")
+            st.info("Previous session data is preserved in Redis and can be viewed in the session history.")
+            
+        except Exception as e:
+            st.error(f"Error resetting session: {str(e)}")
+
+    def get_session_history_summary(self):
+        """Get a summary of all sessions from Redis"""
+        try:
+            all_sessions = self.session_manager.get_all_sessions()
+            
+            if not all_sessions:
+                return "No previous sessions found."
+            
+            summary = []
+            summary.append(f"📚 **Session History**: {len(all_sessions)} previous sessions")
+            
+            for session in all_sessions[:5]:  # Show last 5 sessions
+                session_id = session['session_id']
+                timestamp = session.get('last_activity', 'Unknown')
+                interaction_count = session.get('total_turns', 0)
+                
+                summary.append(f"🆔 **Session {session_id[:8]}...**: {interaction_count} interactions ({timestamp})")
+            
+            if len(all_sessions) > 5:
+                summary.append(f"... and {len(all_sessions) - 5} more sessions")
+            
+            return "\n".join(summary)
+            
+        except Exception as e:
+            return f"Error retrieving session history: {str(e)}"
+
+    def llm_analyze_data(self, filename: str, df: pd.DataFrame):
+        """LLM-powered agent that intelligently analyzes uploaded data"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Prepare data summary for LLM
+            data_summary = f"Dataset: {filename}, Shape: {df.shape}, Columns: {list(df.columns)}"
+            
+            # Get sample data (first 5 rows, formatted nicely)
+            sample_data = df.head(5).to_string(index=False, max_cols=10, max_colwidth=20)
+            
+            # Get basic statistics for context
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+            
+            stats_summary = ""
+            if numeric_cols:
+                stats_summary += f"\nNumeric columns: {numeric_cols[:3]}{'...' if len(numeric_cols) > 3 else ''}"
+                if len(numeric_cols) > 0:
+                    col = numeric_cols[0]
+                    stats_summary += f"\nSample stats for {col}: min={df[col].min():.2f}, max={df[col].max():.2f}, mean={df[col].mean():.2f}"
+            
+            if categorical_cols:
+                stats_summary += f"\nCategorical columns: {categorical_cols[:3]}{'...' if len(categorical_cols) > 3 else ''}"
+                if len(categorical_cols) > 0:
+                    col = categorical_cols[0]
+                    unique_count = df[col].nunique()
+                    stats_summary += f"\nUnique values in {col}: {unique_count}"
+            
+            prompt = f"""
+            Analyze this dataset and provide intelligent insights. Focus on patterns, anomalies, and interesting findings that would be valuable to a data analyst.
+
+            Dataset Information:
+            {data_summary}
+            {stats_summary}
+
+            Sample Data (first 5 rows):
+            {sample_data}
+
+            Please provide 3-5 intelligent insights about:
+            1. Data patterns or trends you notice
+            2. Potential anomalies or outliers
+            3. Interesting relationships between variables
+            4. Data quality observations
+            5. Recommendations for further analysis
+
+            Format your response as a clear, professional analysis with bullet points.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful data analysis assistant. Provide clear, professional insights."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1000,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Store insights in session
+            if session_id not in self.agent_insights:
+                self.agent_insights[session_id] = {}
+            if filename not in self.agent_insights[session_id]:
+                self.agent_insights[session_id][filename] = {}
+            self.agent_insights[session_id][filename]['analysis'] = response
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=f"LLM analysis of {filename}",
+                assistant_response=response,
+                metadata={"type": "llm_analysis", "filename": filename}
+            )
+            
+            return response
+            
+        except Exception as e:
+            st.error(f"Error in LLM analysis: {str(e)}")
+            return f"Error analyzing {filename}: {str(e)}"
+
+    def llm_quality_check(self, filename: str, df: pd.DataFrame):
+        """LLM-powered agent that intelligently assesses data quality"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Prepare quality metrics for LLM
+            missing_counts = df.isnull().sum()
+            total_missing = missing_counts.sum()
+            missing_cols = missing_counts[missing_counts > 0]
+            
+            duplicate_count = df.duplicated().sum()
+            
+            # Calculate outlier information for numeric columns
+            numeric_cols = df.select_dtypes(include=['number']).columns
+            outlier_info = []
+            for col in numeric_cols[:3]:
+                Q1 = df[col].quantile(0.25)
+                Q3 = df[col].quantile(0.75)
+                IQR = Q3 - Q1
+                outliers = df[(df[col] < Q1 - 1.5*IQR) | (df[col] > Q3 + 1.5*IQR)]
+                if len(outliers) > 0:
+                    outlier_info.append(f"{col}: {len(outliers)} outliers ({len(outliers)/len(df)*100:.1f}%)")
+            
+            # Data type information
+            data_types = df.dtypes.to_dict()
+            categorical_cols = df.select_dtypes(include=['object']).columns
+            
+            quality_summary = f"""
+            Dataset: {filename}
+            Shape: {df.shape}
+            
+            Quality Metrics:
+            - Missing values: {total_missing} total across {len(missing_cols)} columns
+            - Duplicate rows: {duplicate_count} ({duplicate_count/len(df)*100:.1f}%)
+            - Outliers detected: {len(outlier_info)} columns with outliers
+            - Data types: {dict(data_types)}
+            """
+            
+            if missing_cols.any():
+                quality_summary += f"\nMissing value details:\n{missing_cols.to_string()}"
+            
+            if outlier_info:
+                quality_summary += f"\nOutlier details:\n{chr(10).join(outlier_info)}"
+            
+            prompt = f"""
+            Assess the quality of this dataset and provide intelligent insights about data quality issues.
+
+            {quality_summary}
+
+            Please provide a comprehensive quality assessment including:
+            1. Critical quality issues that need immediate attention
+            2. Potential data integrity problems
+            3. Recommendations for data cleaning
+            4. Impact assessment of quality issues on analysis
+            5. Suggestions for handling specific problems
+
+            Focus on actionable insights and prioritize issues by severity.
+            Format your response as a professional quality assessment report.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a data quality assessment expert. Provide clear, actionable quality insights."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1000,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Store quality report in session
+            if session_id not in self.agent_insights:
+                self.agent_insights[session_id] = {}
+            if filename not in self.agent_insights[session_id]:
+                self.agent_insights[session_id][filename] = {}
+            self.agent_insights[session_id][filename]['quality'] = response
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=f"LLM quality assessment of {filename}",
+                assistant_response=response,
+                metadata={"type": "llm_quality_check", "filename": filename}
+            )
+            
+            return response
+            
+        except Exception as e:
+            st.error(f"Error in LLM quality check: {str(e)}")
+            return f"Error assessing quality of {filename}: {str(e)}"
+
+    def llm_suggest_queries(self, filename: str, df: pd.DataFrame):
+        """LLM-powered agent that generates intelligent query suggestions"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Prepare data context for LLM
+            data_summary = f"Dataset: {filename}, Shape: {df.shape}, Columns: {list(df.columns)}"
+            
+            # Get sample data
+            sample_data = df.head(3).to_string(index=False, max_cols=10, max_colwidth=20)
+            
+            # Get column information
+            numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+            categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+            datetime_cols = df.select_dtypes(include=['datetime']).columns.tolist()
+            
+            column_info = f"""
+            Column Types:
+            - Numeric: {numeric_cols[:5]}{'...' if len(numeric_cols) > 5 else ''}
+            - Categorical: {categorical_cols[:5]}{'...' if len(categorical_cols) > 5 else ''}
+            - DateTime: {datetime_cols[:3]}{'...' if len(datetime_cols) > 3 else ''}
+            """
+            
+            # Add some basic statistics for context
+            if numeric_cols:
+                col = numeric_cols[0]
+                column_info += f"\nSample numeric stats for {col}: min={df[col].min():.2f}, max={df[col].max():.2f}, mean={df[col].mean():.2f}"
+            
+            if categorical_cols:
+                col = categorical_cols[0]
+                unique_count = df[col].nunique()
+                column_info += f"\nSample categorical info for {col}: {unique_count} unique values"
+            
+            prompt = f"""
+            Based on this dataset, generate 8-10 intelligent and specific questions that a data analyst would want to ask.
+
+            Dataset Information:
+            {data_summary}
+            {column_info}
+
+            Sample Data:
+            {sample_data}
+
+            Generate questions that would provide valuable insights such as:
+            1. Statistical analysis questions (correlations, distributions, trends)
+            2. Business intelligence questions (patterns, anomalies, performance)
+            3. Data exploration questions (relationships, groupings, comparisons)
+            4. Predictive analysis questions (trends, forecasting, patterns)
+            5. Data quality questions (validation, consistency, completeness)
+
+            Make the questions specific to the actual columns and data types in this dataset.
+            Format each question clearly and make them actionable for analysis.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a data analysis expert. Generate specific, actionable questions for data exploration."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1000,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Store suggestions in session
+            if session_id not in self.agent_insights:
+                self.agent_insights[session_id] = {}
+            if filename not in self.agent_insights[session_id]:
+                self.agent_insights[session_id][filename] = {}
+            self.agent_insights[session_id][filename]['suggestions'] = response
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=f"LLM query suggestions for {filename}",
+                assistant_response=response,
+                metadata={"type": "llm_query_suggestions", "filename": filename}
+            )
+            
+            return response
+            
+        except Exception as e:
+            st.error(f"Error generating LLM suggestions: {str(e)}")
+            return f"Error generating suggestions for {filename}: {str(e)}"
+
+    def run_automatic_agents(self, filename: str, df: pd.DataFrame):
+        """Run all LLM-powered agents for newly uploaded data"""
+        # Check if OpenAI API key is available
+        if not os.getenv("OPENAI_API_KEY"):
+            st.error("❌ OpenAI API key not found. LLM agents cannot run.")
+            st.info("Please add your OpenAI API key to the .env file to enable LLM analysis.")
+            return
+        
+        with st.spinner(f"🤖 LLM Agents analyzing {filename}..."):
+            # Run all LLM agents
+            analysis_insights = self.llm_analyze_data(filename, df)
+            quality_report = self.llm_quality_check(filename, df)
+            query_suggestions = self.llm_suggest_queries(filename, df)
+            
+            # Display results automatically
+            st.success(f"✅ **LLM Analysis Complete for {filename}**")
+            
+            # Show insights in expandable sections
+            with st.expander(f"🧠 LLM Data Analysis - {filename}", expanded=True):
+                st.markdown(analysis_insights)
+            
+            with st.expander(f"🔍 LLM Quality Assessment - {filename}", expanded=True):
+                st.markdown(quality_report)
+            
+            with st.expander(f"💡 LLM Query Suggestions - {filename}", expanded=True):
+                st.markdown(query_suggestions)
+
+    def get_all_vector_data(self) -> str:
+        """Retrieve all data from the vector database for analysis"""
+        if self.vectorstore is None:
+            return "No vector database available. Please upload some data first."
+        
+        try:
+            # Get all documents from the vectorstore
+            all_docs = self.vectorstore.similarity_search("", k=1000)  # Large k to get most/all documents
+            
+            if not all_docs:
+                return "No data found in vector database."
+            
+            # Combine all document content
+            combined_content = "\n\n".join([doc.page_content for doc in all_docs])
+            
+            # Get metadata summary
+            metadata_summary = {}
+            for doc in all_docs:
+                if hasattr(doc, 'metadata') and doc.metadata:
+                    filename = doc.metadata.get('filename', 'unknown')
+                    if filename not in metadata_summary:
+                        metadata_summary[filename] = 0
+                    metadata_summary[filename] += 1
+            
+            summary = f"Total documents in vector database: {len(all_docs)}\n"
+            summary += f"Files represented: {list(metadata_summary.keys())}\n"
+            summary += f"Document distribution: {metadata_summary}\n\n"
+            summary += "Combined content:\n" + combined_content[:5000] + "..." if len(combined_content) > 5000 else combined_content
+            
+            return summary
+            
+        except Exception as e:
+            return f"Error retrieving vector data: {str(e)}"
+
+    def llm_analyze_all_data(self):
+        """LLM-powered agent that analyzes all data in the vector database"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Get all data from vector database
+            all_data = self.get_all_vector_data()
+            
+            if "No data found" in all_data or "No vector database" in all_data:
+                return "No data available for analysis. Please upload some files first."
+            
+            prompt = f"""
+            Analyze all the data in this session's vector database and provide comprehensive insights. 
+            Focus on patterns, relationships, and insights across all datasets.
+
+            All Session Data:
+            {all_data}
+
+            Please provide 5-7 intelligent insights about:
+            1. Cross-dataset patterns and relationships
+            2. Overall data quality and consistency
+            3. Key themes and trends across all data
+            4. Potential business insights or opportunities
+            5. Recommendations for further analysis
+            6. Data integration opportunities
+            7. Anomalies or interesting findings
+
+            Format your response as a clear, professional analysis with bullet points.
+            Focus on insights that span across multiple datasets rather than individual file analysis.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a comprehensive data analysis expert. Provide insights across multiple datasets."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1500,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query="LLM analysis of all session data",
+                assistant_response=response,
+                metadata={"type": "llm_analysis_all_data"}
+            )
+            
+            return response
+            
+        except Exception as e:
+            return f"Error in LLM analysis: {str(e)}"
+
+    def llm_quality_check_all_data(self):
+        """LLM-powered agent that assesses quality across all data in the vector database"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Get all data from vector database
+            all_data = self.get_all_vector_data()
+            
+            if "No data found" in all_data or "No vector database" in all_data:
+                return "No data available for quality assessment. Please upload some files first."
+            
+            prompt = f"""
+            Assess the overall quality of all data in this session's vector database. 
+            Focus on cross-dataset quality issues and consistency problems.
+
+            All Session Data:
+            {all_data}
+
+            Please provide a comprehensive quality assessment including:
+            1. Overall data quality score and summary
+            2. Cross-dataset consistency issues
+            3. Data integration challenges
+            4. Quality problems that affect analysis
+            5. Recommendations for data cleaning and standardization
+            6. Potential data governance issues
+            7. Impact assessment on business intelligence
+
+            Focus on quality issues that span across multiple datasets and affect overall analysis quality.
+            Format your response as a professional quality assessment report.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a data quality assessment expert. Focus on cross-dataset quality issues."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1500,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query="LLM quality assessment of all session data",
+                assistant_response=response,
+                metadata={"type": "llm_quality_check_all_data"}
+            )
+            
+            return response
+            
+        except Exception as e:
+            return f"Error in LLM quality check: {str(e)}"
+
+    def llm_suggest_queries_all_data(self):
+        """LLM-powered agent that generates query suggestions for all data in the vector database"""
+        try:
+            session_id = self.session_manager.get_or_create_session_id()
+            
+            # Get all data from vector database
+            all_data = self.get_all_vector_data()
+            
+            if "No data found" in all_data or "No vector database" in all_data:
+                return "No data available for query suggestions. Please upload some files first."
+            
+            prompt = f"""
+            Based on all the data in this session's vector database, generate 10-15 intelligent and specific questions 
+            that would provide valuable cross-dataset insights.
+
+            All Session Data:
+            {all_data}
+
+            Generate questions that would provide valuable insights such as:
+            1. Cross-dataset correlation and relationship questions
+            2. Data integration and consistency questions
+            3. Business intelligence questions spanning multiple datasets
+            4. Data quality and validation questions across datasets
+            5. Predictive analysis questions using combined data
+            6. Comparative analysis questions between datasets
+            7. Trend analysis questions across time or categories
+            8. Anomaly detection questions across datasets
+
+            Make the questions specific to the actual data available and focus on insights that require 
+            analysis across multiple datasets rather than single dataset questions.
+            Format each question clearly and make them actionable for analysis.
+            """
+            
+            # Generate LLM response using OpenAI directly
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[
+                        {"role": "system", "content": "You are a data analysis expert. Generate cross-dataset query suggestions."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_tokens=1500,
+                    temperature=0.3
+                )
+                response = response.choices[0].message.content
+            except Exception as e:
+                response = f"Error generating LLM response: {str(e)}"
+            
+            # Save to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query="LLM query suggestions for all session data",
+                assistant_response=response,
+                metadata={"type": "llm_query_suggestions_all_data"}
+            )
+            
+            return response
+            
+        except Exception as e:
+            return f"Error generating LLM suggestions: {str(e)}"
 
     def process_csv(self, uploaded_file, filename: str) -> pd.DataFrame:
         """Process uploaded CSV file using LangChain"""
@@ -459,7 +1112,12 @@ class CSVChatApp:
             self.setup_langchain()
             
             # Process with LangChain CSVLoader
-            self.process_with_langchain(uploaded_file, filename, "csv")
+            langchain_success = self.process_with_langchain(uploaded_file, filename, "csv")
+            if not langchain_success:
+                st.error(f"Failed to process {filename} with LangChain")
+                return None
+            
+            # Note: LLM agents are now available as manual buttons in the main interface
             
             return df
         except Exception as e:
@@ -480,6 +1138,9 @@ class CSVChatApp:
                 self.processed_files.add(filename)
                 self.setup_langchain()
                 self.process_excel_sheet_with_langchain(df, filename)
+                
+                # Note: LLM agents are now available as manual buttons in the main interface
+                
                 return df
             else:
                 # Multiple sheets - process each sheet separately
@@ -503,6 +1164,8 @@ class CSVChatApp:
                             
                             # Process this sheet with LangChain
                             self.process_excel_sheet_with_langchain(df, sheet_filename)
+                            
+                            # Note: LLM agents are now available as manual buttons in the main interface
                             
                             processed_sheets.append(sheet_name)
                             total_rows += len(df)
@@ -537,83 +1200,71 @@ class CSVChatApp:
             if file_type == "csv":
                 # Save uploaded file temporarily
                 temp_path = f"temp_{filename}"
-                
-                # Check if file has content
-                uploaded_file.seek(0)  # Reset to beginning
-                file_content = uploaded_file.read()
-                
-                if len(file_content) == 0:
-                    st.error(f"Uploaded file {filename} is empty. Please try uploading again.")
-                    return
-                
                 with open(temp_path, 'wb') as f:
-                    f.write(file_content)
+                    f.write(uploaded_file.read())
                 
-                # Debug info
-                st.info(f"Uploaded file size: {len(file_content)} bytes")
-                st.info(f"Temp file size: {os.path.getsize(temp_path)} bytes")
+                # Load with LangChain CSVLoader
+                loader = CSVLoader(temp_path)
+                documents = loader.load()
                 
-                # Reset file pointer for later use
-                uploaded_file.seek(0)
+                # Add metadata to all documents (don't filter)
+                for doc in documents:
+                    doc.metadata.update({
+                        "filename": filename,
+                        "file_type": "csv",
+                        "content_type": "data_row"
+                    })
+                valid_documents = documents
                 
-
+                if not valid_documents:
+                    st.warning(f"No valid content found in {filename} to process")
+                    st.info("This might be due to empty rows or formatting issues. Check your CSV file.")
+                    return False
                 
-                # Load CSV with pandas and convert to documents
-                try:
-                    # Try reading with different encodings
-                    try:
-                        df = pd.read_csv(temp_path)
-                    except:
-                        df = pd.read_csv(temp_path, encoding='utf-8')
-                    
-                    if df.empty:
-                        st.error(f"CSV file {filename} is empty")
-                        return
-                except Exception as csv_error:
-                    st.error(f"Error reading CSV file {filename}: {str(csv_error)}")
-                    # Debug: show file content
-                    try:
-                        with open(temp_path, 'r') as f:
-                            content = f.read(500)
-                            st.error(f"File content preview: {repr(content)}")
-                    except:
-                        st.error("Could not read file content for debugging")
+                # Ensure text_splitter is initialized
+                if self.text_splitter is None:
+                    st.error("Text splitter not initialized. Please check your OpenAI API key.")
                     return
                 
-                documents = []
+                # Split documents
+                chunks = self.text_splitter.split_documents(valid_documents)
                 
-                for idx, row in df.iterrows():
-                    # Create document from row - convert each row to text
-                    row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
-                    doc = type('Document', (), {
-                        'page_content': row_text,
-                        'metadata': {
-                            'filename': filename,
-                            'row_index': idx,
-                            'file_type': 'csv',
-                            'content_type': 'data_row'
-                        }
-                    })()
-                    documents.append(doc)
+                # Filter out empty chunks
+                valid_chunks = []
+                for chunk in chunks:
+                    if chunk.page_content and chunk.page_content.strip():
+                        valid_chunks.append(chunk)
                 
-                st.info(f"Created {len(documents)} documents from {len(df)} CSV rows")
+                if not valid_chunks:
+                    st.warning(f"No valid content found in {filename} after processing")
+                    st.info("This might be due to very small content that gets filtered out during chunking.")
+                    return False
                 
-                # Use documents directly (no splitting needed for CSV)
-                chunks = documents
+                # Debug information
+                st.info(f"Original documents: {len(valid_documents)}, Chunks after splitting: {len(chunks)}, Valid chunks: {len(valid_chunks)}")
                 
-                # Use all chunks (don't filter)
-                valid_chunks = chunks
+                # Verify embeddings are properly initialized
+                if not self.embeddings:
+                    st.error("Embeddings not properly initialized. Please check your OpenAI API key.")
+                    return
                 
                 # Add to vectorstore
-                self.vectorstore.add_documents(valid_chunks)
+                try:
+                    self.vectorstore.add_documents(valid_chunks)
+                except Exception as embedding_error:
+                    st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                    st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                    return False
                 
                 # Clean up temp file
                 os.remove(temp_path)
                 
                 st.success(f"Processed {len(valid_chunks)} chunks from {filename} with LangChain")
+                return True
                 
         except Exception as e:
             st.error(f"Error processing {filename} with LangChain: {str(e)}")
+            return False
 
     def process_excel_sheet_with_langchain(self, df: pd.DataFrame, filename: str):
         """Process Excel sheet data with LangChain"""
@@ -623,24 +1274,65 @@ class CSVChatApp:
             for idx, row in df.iterrows():
                 # Create document from row
                 row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
-                doc = type('Document', (), {
-                    'page_content': row_text,
-                    'metadata': {
-                        'filename': filename,
-                        'row_index': idx,
-                        'file_type': 'excel',
-                        'content_type': 'data_row'
-                    }
-                })()
-                documents.append(doc)
+                
+                # Only add documents with meaningful content - more lenient
+                if row_text and row_text.strip():
+                    doc = type('Document', (), {
+                        'page_content': row_text,
+                        'metadata': {
+                            'filename': filename,
+                            'row_index': idx,
+                            'file_type': 'excel',
+                            'content_type': 'data_row'
+                        }
+                    })()
+                    documents.append(doc)
+            
+            # Check if we have any documents to process
+            if not documents:
+                st.warning(f"No valid content found in {filename} to process")
+                return
+            
+            # Ensure text_splitter is initialized
+            if self.text_splitter is None:
+                st.error("Text splitter not initialized. Please check your OpenAI API key.")
+                return
+            
+            # Ensure text_splitter is initialized
+            if self.text_splitter is None:
+                st.error("Text splitter not initialized. Please check your OpenAI API key.")
+                return
             
             # Split documents
             chunks = self.text_splitter.split_documents(documents)
             
-            # Add to vectorstore
-            self.vectorstore.add_documents(chunks)
+            # Filter out empty chunks
+            valid_chunks = []
+            for chunk in chunks:
+                if chunk.page_content and chunk.page_content.strip():
+                    valid_chunks.append(chunk)
             
-            st.success(f"Processed {len(chunks)} chunks from {filename} with LangChain")
+            if not valid_chunks:
+                st.warning(f"No valid content found in {filename} after processing")
+                return
+            
+            # Debug information
+            st.info(f"Original documents: {len(documents)}, Chunks after splitting: {len(chunks)}, Valid chunks: {len(valid_chunks)}")
+            
+            # Verify embeddings are properly initialized
+            if not self.embeddings:
+                st.error("Embeddings not properly initialized. Please check your OpenAI API key.")
+                return
+            
+            # Add to vectorstore
+            try:
+                self.vectorstore.add_documents(valid_chunks)
+            except Exception as embedding_error:
+                st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                return
+            
+            st.success(f"Processed {len(valid_chunks)} chunks from {filename} with LangChain")
             
         except Exception as e:
             st.error(f"Error processing Excel sheet {filename} with LangChain: {str(e)}")
@@ -648,6 +1340,11 @@ class CSVChatApp:
     def process_text_with_langchain(self, text_content: str, filename: str):
         """Process text content with LangChain"""
         try:
+            # Validate text content
+            if not text_content or not text_content.strip() or len(text_content.strip()) < 10:
+                st.warning(f"No valid content found in {filename} to process")
+                return
+            
             # Create document from text content
             doc = type('Document', (), {
                 'page_content': text_content,
@@ -657,6 +1354,11 @@ class CSVChatApp:
                     'content_type': 'text'
                 }
             })()
+            
+            # Ensure text_splitter is initialized
+            if self.text_splitter is None:
+                st.error("Text splitter not initialized. Please check your OpenAI API key.")
+                return
             
             # Split document
             chunks = self.text_splitter.split_documents([doc])
@@ -669,10 +1371,33 @@ class CSVChatApp:
                     'content_type': 'text_chunk'
                 })
             
-            # Add to vectorstore
-            self.vectorstore.add_documents(chunks)
+            # Filter out empty chunks
+            valid_chunks = []
+            for chunk in chunks:
+                if chunk.page_content and chunk.page_content.strip():
+                    valid_chunks.append(chunk)
             
-            st.success(f"Processed {len(chunks)} text chunks from {filename} with LangChain")
+            if not valid_chunks:
+                st.warning(f"No valid content found in {filename} after processing")
+                return
+            
+            # Debug information
+            st.info(f"Original document length: {len(text_content)}, Chunks after splitting: {len(chunks)}, Valid chunks: {len(valid_chunks)}")
+            
+            # Verify embeddings are properly initialized
+            if not self.embeddings:
+                st.error("Embeddings not properly initialized. Please check your OpenAI API key.")
+                return
+            
+            # Add to vectorstore
+            try:
+                self.vectorstore.add_documents(valid_chunks)
+            except Exception as embedding_error:
+                st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                return
+            
+            st.success(f"Processed {len(valid_chunks)} text chunks from {filename} with LangChain")
             
         except Exception as e:
             st.error(f"Error processing text {filename} with LangChain: {str(e)}")
@@ -695,6 +1420,17 @@ class CSVChatApp:
             # Track the uploaded text file
             self.text_files.add(filename)
             self.processed_files.add(filename)  # Mark as processed
+            
+            # AUTOMATIC: Run AI agents on the text content
+            if os.getenv("OPENAI_API_KEY"):
+                # Create a simple dataframe representation for analysis
+                text_df = pd.DataFrame({
+                    'content': [text_content],
+                    'length': [len(text_content)],
+                    'word_count': [len(text_content.split())],
+                    'line_count': [len(text_content.split('\n'))]
+                })
+                # Note: LLM agents are now available as manual buttons in the main interface
             
             return True
         except Exception as e:
@@ -1938,9 +2674,13 @@ def main():
         layout="wide"
     )
 
-    # Just the logo as title
-    st.image("assets/abi_horiizontal_lime.png", width=450)
-    st.markdown("Upload CSV, Excel files and text documents to chat with your data in natural language!")
+    # Compact header with smaller logo and inline description
+    col1 , col2= st.columns([1, 3])
+    with col1:
+        st.image("assets/abi_horiizontal_lime.png", width=200)
+    with col2:
+        st.markdown("### Upload documents are start gathering insights")
+  
 
     # Initialize app
     if 'app' not in st.session_state:
@@ -1984,87 +2724,11 @@ def main():
             else:
                 st.error("Failed to clear session")
 
-    # Sidebar for file upload
+    # Sidebar for session management and configuration only
     with st.sidebar:
-        st.header("📁 Upload Data")
-        
-        # Data file upload (CSV and Excel)
-        #st.subheader("📊 Data Files")
-        uploaded_files = st.file_uploader(
-            "Choose CSV or Excel files",
-            type=['csv', 'xlsx', 'xls'],
-            accept_multiple_files=True,
-            help="Upload one or more CSV or Excel files to start chatting with them"
-        )
-
-        if uploaded_files:
-            for uploaded_file in uploaded_files:
-                # Check if this file has already been processed
-                file_already_processed = uploaded_file.name in app.processed_files
-                
-                # Also check for Excel sheets that might have been processed
-                if not file_already_processed:
-                    for existing_filename in app.processed_files:
-                        if existing_filename.startswith(uploaded_file.name + "_"):
-                            file_already_processed = True
-                            break
-                
-                if not file_already_processed or st.button(f"Reload {uploaded_file.name}"):
-                    with st.spinner(f"Processing {uploaded_file.name}..."):
-                        # Determine file type and process accordingly
-                        if uploaded_file.name.lower().endswith('.csv'):
-                            df = app.process_csv(uploaded_file, uploaded_file.name)
-                        elif uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
-                            df = app.process_excel(uploaded_file, uploaded_file.name)
-                        else:
-                            st.error(f"Unsupported file type: {uploaded_file.name}")
-                            continue
-                            
-                        if df is not None:
-                            st.success(f"{uploaded_file.name} processed successfully!")
-                            if hasattr(df, 'shape'):
-                                st.write(f"**Shape:** {df.shape}")
-                                st.write(f"**Columns:** {list(df.columns)}")
-                            else:
-                                # This is a summary dataframe for multi-sheet Excel files
-                                st.write("**Processed Sheets:**")
-                                st.dataframe(df)
-                else:
-                    st.info(f"✅ {uploaded_file.name} already processed")
-        
-        # Text file upload
-        #st.subheader("📄 Text Files")
-        uploaded_text_files = st.file_uploader(
-            "Choose text files",
-            type=['txt'],
-            accept_multiple_files=True,
-            help="Upload one or more text files to add to the knowledge base"
-        )
-        
-        if uploaded_text_files:
-            for uploaded_file in uploaded_text_files:
-                # Check if this text file has already been processed
-                if uploaded_file.name not in app.processed_files:
-                    with st.spinner(f"Processing text file {uploaded_file.name}..."):
-                        success = app.process_text_file(uploaded_file, uploaded_file.name)
-                        if success:
-                            st.success(f"Text file '{uploaded_file.name}' processed and added to vector database!")
-                        else:
-                            st.error(f"Failed to process text file '{uploaded_file.name}'")
-                else:
-                    st.info(f"✅ Text file '{uploaded_file.name}' already processed")
-        
         # Show loaded datasets
         if app.dfs or app.text_files:
             st.header("📊 Loaded Datasets")
-            
-            # Add button to re-index all data
-            if st.button("🔄 Re-index All Data"):
-                with st.spinner("Re-indexing all data..."):
-                    app.setup_chroma()  # This will clear and recreate the collection
-                    for filename, df in app.dfs.items():
-                        app.index_data(filename, df)
-                st.success("All data re-indexed successfully!")
             
             # Add button to clear all data
             if st.button("🗑️ Clear All Data"):
@@ -2072,7 +2736,10 @@ def main():
                 app.text_files.clear()
                 app.text_contents.clear()
                 app.processed_files.clear()  # Clear processed files tracking
-                app.setup_chroma()  # This will clear the ChromaDB collection
+                
+                # Clear the vectorstore
+                app.clear_vectorstore()
+                
                 st.success("All data cleared!")
                 st.rerun()
             
@@ -2091,18 +2758,10 @@ def main():
                         if filename in app.processed_files:
                             app.processed_files.remove(filename)
                         
-                        # Remove from ChromaDB
-                        if app.collection:
-                            try:
-                                # Get all IDs for this filename
-                                results = app.collection.get(
-                                    where={"filename": filename}
-                                )
-                                if results['ids']:
-                                    app.collection.delete(ids=results['ids'])
-                                    st.success(f"Removed {filename} from database")
-                            except Exception as e:
-                                st.error(f"Error removing from database: {str(e)}")
+                        # Note: LangChain Chroma doesn't support direct deletion by metadata
+                        # The document will remain in the vectorstore but won't be accessible
+                        # through the app interface
+                        st.info(f"Removed {filename} from memory. Note: Vector embeddings remain in database.")
                         
                         st.rerun()
             
@@ -2155,21 +2814,53 @@ def main():
                         if filename in app.processed_files:
                             app.processed_files.remove(filename)
                         
-                        # Remove from ChromaDB
-                        if app.collection:
-                            try:
-                                # Get all IDs for this filename
-                                results = app.collection.get(
-                                    where={"filename": filename}
-                                )
-                                if results['ids']:
-                                    app.collection.delete(ids=results['ids'])
-                                    st.success(f"Removed {filename} from database")
-                            except Exception as e:
-                                st.error(f"Error removing from database: {str(e)}")
+                        # Note: LangChain Chroma doesn't support direct deletion by metadata
+                        # The document will remain in the vectorstore but won't be accessible
+                        # through the app interface
+                        st.info(f"Removed {filename} from memory. Note: Vector embeddings remain in database.")
                         
                         st.rerun()
 
+        # Session Management
+        st.header("🆔 Session Management")
+        
+        # Show current session info
+        current_session_id = app.session_manager.get_or_create_session_id()
+        st.info(f"**Current Session**: {current_session_id[:8]}...")
+        
+        # Session history
+        with st.expander("📚 Session History"):
+            history_summary = app.get_session_history_summary()
+            st.write(history_summary)
+            
+            # Show detailed history
+            all_sessions = app.session_manager.get_all_sessions()
+            if all_sessions:
+                st.subheader("Detailed History")
+                for session in all_sessions[:3]:  # Show last 3 sessions
+                    # Get interaction count safely
+                    interaction_count = session.get('total_turns', 0)
+                    
+                    # Use a container instead of nested expander
+                    with st.container():
+                        st.markdown(f"**Session {session['session_id'][:8]}... ({interaction_count} interactions)**")
+                        st.write(f"**Last Activity**: {session.get('last_activity', 'Unknown')}")
+                        st.write(f"**Interactions**: {interaction_count}")
+                        
+                        # Show conversation history for this session
+                        conversation = app.session_manager.get_conversation_history(session['session_id'])
+                        if conversation:
+                            st.write("**Recent Interactions**:")
+                            for turn in conversation[-3:]:  # Show last 3 interactions
+                                timestamp = turn.get('timestamp', 'Unknown')[:19] if turn.get('timestamp') else 'Unknown'
+                                user_query = turn.get('user_query', 'No query')[:50] + '...' if turn.get('user_query') else 'No query'
+                                st.write(f"- **{timestamp}**: {user_query}")
+        
+        # Reset session button
+        if st.button("🔄 Reset Session"):
+            app.reset_session()
+            st.rerun()
+        
         # Configuration info
         st.header("🔑 Configuration")
         if os.getenv("OPENAI_API_KEY"):
@@ -2178,9 +2869,106 @@ def main():
             st.error("❌ OpenAI API Key not found in .env file")
             st.info("Please add OPENAI_API_KEY to your .env file")
 
+    # Main content area
+    if not (app.dfs or app.text_files):
+        # Upload section when no data is loaded
+        st.header("📁 Upload Your Data")
+        st.markdown("Upload CSV, Excel, or text files to start analyzing your data with AI.")
+        
+        # Unified file uploader
+        uploaded_files = st.file_uploader(
+            "Choose files to upload",
+            type=['csv', 'xlsx', 'xls', 'txt'],
+            accept_multiple_files=True,
+            help="Upload CSV, Excel, or text files. All file types will be processed automatically."
+        )
+
+        if uploaded_files:
+            for uploaded_file in uploaded_files:
+                # Check if this file has already been processed
+                file_already_processed = uploaded_file.name in app.processed_files
+                
+                # Also check for Excel sheets that might have been processed
+                if not file_already_processed:
+                    for existing_filename in app.processed_files:
+                        if existing_filename.startswith(uploaded_file.name + "_"):
+                            file_already_processed = True
+                            break
+                
+                if not file_already_processed or st.button(f"Reload {uploaded_file.name}"):
+                    with st.spinner(f"Processing {uploaded_file.name}..."):
+                        # Determine file type and process accordingly
+                        if uploaded_file.name.lower().endswith('.csv'):
+                            df = app.process_csv(uploaded_file, uploaded_file.name)
+                            if df is not None:
+                                st.success(f"✅ {uploaded_file.name} processed successfully!")
+                                st.write(f"**Shape:** {df.shape} | **Columns:** {list(df.columns)}")
+                        elif uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+                            df = app.process_excel(uploaded_file, uploaded_file.name)
+                            if df is not None:
+                                st.success(f"✅ {uploaded_file.name} processed successfully!")
+                                if hasattr(df, 'shape'):
+                                    st.write(f"**Shape:** {df.shape} | **Columns:** {list(df.columns)}")
+                                else:
+                                    st.write("**Processed Sheets:**")
+                                    st.dataframe(df)
+                        elif uploaded_file.name.lower().endswith('.txt'):
+                            success = app.process_text_file(uploaded_file, uploaded_file.name)
+                            if success:
+                                st.success(f"✅ Text file '{uploaded_file.name}' processed and added to vector database!")
+                            else:
+                                st.error(f"❌ Failed to process text file '{uploaded_file.name}'")
+                        else:
+                            st.error(f"❌ Unsupported file type: {uploaded_file.name}")
+                            continue
+                else:
+                    st.info(f"✅ {uploaded_file.name} already processed")
+            
+            # Show a success message and prompt to start chatting
+            if uploaded_files:
+                st.success("🎉 Files uploaded successfully! You can now start chatting with your data.")
+                st.markdown("---")
+    
     # Main chat interface
     if app.dfs or app.text_files:
         st.header("💬 Chat with Your Data")
+        
+        # AI Agents Section
+        st.subheader("🤖 AI Analysis Agents")
+        st.markdown("Run intelligent analysis on all your uploaded data:")
+        
+        # Check if OpenAI API key is available
+        if not os.getenv("OPENAI_API_KEY"):
+            st.warning("⚠️ OpenAI API key not found. AI agents require an OpenAI API key to function.")
+            st.info("Please add your OpenAI API key to the .env file to enable AI analysis.")
+        else:
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                if st.button("🧠 Analyze All Data", help="Get comprehensive insights across all datasets"):
+                    with st.spinner("🤖 AI Agent analyzing all data..."):
+                        analysis_result = app.llm_analyze_all_data()
+                        st.success("✅ Analysis Complete!")
+                        with st.expander("🧠 AI Data Analysis Results", expanded=True):
+                            st.markdown(analysis_result)
+            
+            with col2:
+                if st.button("🔍 Quality Assessment", help="Assess data quality across all datasets"):
+                    with st.spinner("🤖 AI Agent checking data quality..."):
+                        quality_result = app.llm_quality_check_all_data()
+                        st.success("✅ Quality Assessment Complete!")
+                        with st.expander("🔍 AI Quality Assessment Results", expanded=True):
+                            st.markdown(quality_result)
+            
+            with col3:
+                if st.button("💡 Query Suggestions", help="Get intelligent query suggestions for all data"):
+                    with st.spinner("🤖 AI Agent generating query suggestions..."):
+                        suggestions_result = app.llm_suggest_queries_all_data()
+                        st.success("✅ Query Suggestions Complete!")
+                        with st.expander("💡 AI Query Suggestions", expanded=True):
+                            st.markdown(suggestions_result)
+        
+        st.markdown("---")
 
         # Display data preview
         with st.expander("📋 Data Preview"):
@@ -2245,21 +3033,13 @@ def main():
         if st.button("Clear Chat"):
             st.session_state.messages = []
             st.rerun()
-
-    else:
-        st.info("👆 Please upload a CSV or Excel file in the sidebar to get started!")
-
-        # Example queries
-        st.header("💡 Example Questions")
-        st.markdown("""
-        Once you upload your data, you can ask questions like:
-        - "What are the main trends in this data?"
-        - "Show me the top 5 values in column X"
-        - "What's the average of column Y?"
-        - "Create a chart showing the relationship between X and Y"
-        - "Are there any outliers in the data?"
-        - "What insights can you find in this dataset?"
-        """)
+        
+        # Reset database button (for troubleshooting)
+        if st.button("🔄 Reset Database (Troubleshoot)"):
+            with st.spinner("Resetting database..."):
+                app.clear_vectorstore()
+                st.success("Database reset complete! You may need to re-upload your files.")
+                st.rerun()
 
 if __name__ == "__main__":
     main()
