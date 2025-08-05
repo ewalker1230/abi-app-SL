@@ -15,6 +15,8 @@ import re
 import hashlib
 from functools import lru_cache
 import time
+import uuid
+from datetime import datetime
 
 # LangChain imports
 from langchain_community.document_loaders import CSVLoader, UnstructuredExcelLoader
@@ -29,6 +31,172 @@ load_dotenv()
 
 # Configure OpenAI
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+class SessionManager:
+    """Manages user sessions and stores conversation history in Redis"""
+    
+    def __init__(self):
+        """Initialize Redis connection and session management"""
+        try:
+            import redis
+            # Get Redis configuration from environment variables
+            redis_host = os.getenv("REDIS_HOST", "localhost")
+            redis_port = int(os.getenv("REDIS_PORT", 6379))
+            redis_db = int(os.getenv("REDIS_DB", 0))
+            redis_password = os.getenv("REDIS_PASSWORD", None)
+            
+            self.redis_client = redis.Redis(
+                host=redis_host,
+                port=redis_port,
+                db=redis_db,
+                password=redis_password,
+                decode_responses=True  # Automatically decode responses to strings
+            )
+            
+            # Test connection
+            self.redis_client.ping()
+            self.redis_available = True
+            print("✅ Redis connection established successfully")
+            
+        except Exception as e:
+            print(f"⚠️ Redis connection failed: {str(e)}")
+            self.redis_available = False
+            self.redis_client = None
+    
+    def generate_session_id(self) -> str:
+        """Generate a unique session ID"""
+        return str(uuid.uuid4())
+    
+    def get_or_create_session_id(self) -> str:
+        """Get existing session ID from Streamlit session state or create new one"""
+        if 'session_id' not in st.session_state:
+            st.session_state.session_id = self.generate_session_id()
+            print(f"🆔 Created new session: {st.session_state.session_id}")
+        return st.session_state.session_id
+    
+    def save_conversation_turn(self, session_id: str, user_query: str, assistant_response: str, 
+                              execution_time: float = None, metadata: Dict[str, Any] = None):
+        """Save a conversation turn (query + response) to Redis"""
+        if not self.redis_available:
+            print("⚠️ Redis not available, skipping conversation save")
+            return
+        
+        try:
+            # Create conversation entry
+            conversation_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "user_query": user_query,
+                "assistant_response": assistant_response,
+                "execution_time": execution_time,
+                "metadata": metadata or {}
+            }
+            
+            # Use Redis list to store conversation history
+            # Key format: session:{session_id}:conversation
+            session_key = f"session:{session_id}:conversation"
+            
+            # Add to the end of the list
+            self.redis_client.rpush(session_key, json.dumps(conversation_entry))
+            
+            # Set expiration for session data (24 hours)
+            self.redis_client.expire(session_key, 86400)
+            
+            # Also save session metadata
+            session_meta_key = f"session:{session_id}:metadata"
+            session_metadata = {
+                "created_at": datetime.now().isoformat(),
+                "last_activity": datetime.now().isoformat(),
+                "total_turns": self.redis_client.llen(session_key)
+            }
+            self.redis_client.setex(session_meta_key, 86400, json.dumps(session_metadata))
+            
+            print(f"💾 Saved conversation turn for session {session_id}")
+            
+        except Exception as e:
+            print(f"❌ Error saving conversation to Redis: {str(e)}")
+    
+    def get_conversation_history(self, session_id: str) -> List[Dict[str, Any]]:
+        """Retrieve conversation history for a session"""
+        if not self.redis_available:
+            print("⚠️ Redis not available, returning empty conversation history")
+            return []
+        
+        try:
+            session_key = f"session:{session_id}:conversation"
+            conversation_data = self.redis_client.lrange(session_key, 0, -1)
+            
+            conversation_history = []
+            for entry in conversation_data:
+                conversation_history.append(json.loads(entry))
+            
+            return conversation_history
+            
+        except Exception as e:
+            print(f"❌ Error retrieving conversation history: {str(e)}")
+            return []
+    
+    def get_session_metadata(self, session_id: str) -> Dict[str, Any]:
+        """Get metadata for a specific session"""
+        if not self.redis_available:
+            return {}
+        
+        try:
+            session_meta_key = f"session:{session_id}:metadata"
+            metadata_json = self.redis_client.get(session_meta_key)
+            
+            if metadata_json:
+                return json.loads(metadata_json)
+            return {}
+            
+        except Exception as e:
+            print(f"❌ Error retrieving session metadata: {str(e)}")
+            return {}
+    
+    def get_all_sessions(self) -> List[Dict[str, Any]]:
+        """Get list of all active sessions"""
+        if not self.redis_available:
+            return []
+        
+        try:
+            # Get all session metadata keys
+            session_keys = self.redis_client.keys("session:*:metadata")
+            sessions = []
+            
+            for key in session_keys:
+                session_id = key.split(":")[1]  # Extract session ID from key
+                metadata = self.get_session_metadata(session_id)
+                if metadata:
+                    sessions.append({
+                        "session_id": session_id,
+                        **metadata
+                    })
+            
+            return sessions
+            
+        except Exception as e:
+            print(f"❌ Error retrieving all sessions: {str(e)}")
+            return []
+    
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and all its data"""
+        if not self.redis_available:
+            return False
+        
+        try:
+            # Delete conversation history
+            conversation_key = f"session:{session_id}:conversation"
+            self.redis_client.delete(conversation_key)
+            
+            # Delete session metadata
+            metadata_key = f"session:{session_id}:metadata"
+            self.redis_client.delete(metadata_key)
+            
+            print(f"🗑️ Deleted session {session_id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error deleting session: {str(e)}")
+            return False
 
 class QueryOptimizer:
     """Optimizes RAG queries for better performance and accuracy"""
@@ -246,6 +414,7 @@ class CSVChatApp:
         self.query_cache = {}  # Cache for query results
         self.performance_metrics = {}  # Track query performance
         self.query_history = []  # Track query patterns for optimization
+        self.session_manager = SessionManager()  # Session management with Redis
 
     def setup_langchain(self):
         """Initialize LangChain components for vector storage"""
@@ -620,6 +789,9 @@ class CSVChatApp:
         """Optimized query method using query preprocessing and adaptive search"""
         start_time = time.time()
         
+        # Get or create session ID
+        session_id = self.session_manager.get_or_create_session_id()
+        
         if not self.dfs and not self.text_files:
             return "Please upload at least one CSV file or text document first."
 
@@ -636,6 +808,16 @@ class CSVChatApp:
             cache_time = time.time() - start_time
             self._record_performance_metrics(query_hash, 'cache_hit', cache_time)
             st.info(f"Returning cached result (retrieved in {cache_time:.2f}s)")
+            
+            # Save conversation turn to Redis even for cached results
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=cached_result,
+                execution_time=cache_time,
+                metadata={'cache_hit': True, 'query_hash': query_hash}
+            )
+            
             return cached_result
 
         # Preprocess and optimize the query
@@ -655,7 +837,19 @@ class CSVChatApp:
             search_time = time.time() - search_start
             
             if not docs:
-                return "No relevant data found. Please make sure your files were processed successfully."
+                response = "No relevant data found. Please make sure your files were processed successfully."
+                
+                # Save conversation turn to Redis
+                total_time = time.time() - start_time
+                self.session_manager.save_conversation_turn(
+                    session_id=session_id,
+                    user_query=user_query,
+                    assistant_response=response,
+                    execution_time=total_time,
+                    metadata={'no_data_found': True, 'query_hash': query_hash}
+                )
+                
+                return response
 
             # Process documents with optimized context building
             processing_start = time.time()
@@ -698,13 +892,40 @@ class CSVChatApp:
                 'timestamp': time.time()
             })
             
+            # Save conversation turn to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=response,
+                execution_time=total_time,
+                metadata={
+                    'query_hash': query_hash,
+                    'strategy': search_strategy,
+                    'complexity': query_analysis['complexity'],
+                    'docs_found': len(docs),
+                    'k': k,
+                    'cache_hit': False
+                }
+            )
+            
             return response
             
         except Exception as e:
             error_time = time.time() - start_time
             self._record_performance_metrics(query_hash, 'error', error_time)
+            error_response = f"Error processing query: {str(e)}"
             st.error(f"Error in optimized query: {str(e)}")
-            return f"Error processing query: {str(e)}"
+            
+            # Save error conversation turn to Redis
+            self.session_manager.save_conversation_turn(
+                session_id=session_id,
+                user_query=user_query,
+                assistant_response=error_response,
+                execution_time=error_time,
+                metadata={'error': True, 'error_message': str(e), 'query_hash': query_hash}
+            )
+            
+            return error_response
     
     def _record_performance_metrics(self, query_hash: str, query_type: str, execution_time: float, details: Dict[str, Any] = None):
         """Record performance metrics for analysis"""
@@ -919,6 +1140,16 @@ class CSVChatApp:
         """Build optimized context based on query analysis"""
         context_parts = []
         
+        # Get conversation history for context
+        session_id = self.session_manager.get_or_create_session_id()
+        conversation_history = self.session_manager.get_conversation_history(session_id)
+        
+        # Add conversation history context if available
+        if conversation_history:
+            recent_context = self._build_conversation_context(conversation_history, query_analysis['original_query'])
+            if recent_context:
+                context_parts.append(f"Previous Conversation Context:\n{recent_context}")
+        
         # Add aggregation results if needed
         if query_analysis['requires_aggregation']:
             aggregation_results = self.perform_aggregation(query_analysis['original_query'])
@@ -1010,15 +1241,75 @@ class CSVChatApp:
         
         return "\n".join(formatted_parts)
     
+    def _build_conversation_context(self, conversation_history: List[Dict[str, Any]], current_query: str) -> str:
+        """Build context from previous conversation turns that are relevant to current query"""
+        if not conversation_history:
+            return ""
+        
+        # Get the last 3 conversation turns for context
+        recent_turns = conversation_history[-3:]
+        
+        # Simple keyword matching to find relevant previous answers
+        current_query_lower = current_query.lower()
+        relevant_contexts = []
+        
+        for turn in recent_turns:
+            previous_query = turn['user_query'].lower()
+            previous_response = turn['assistant_response']
+            
+            # Check if there's semantic similarity or keyword overlap
+            similarity_score = self._calculate_query_similarity(current_query_lower, previous_query)
+            
+            if similarity_score > 0.3:  # Threshold for relevance
+                relevant_contexts.append(f"""
+                Previous Q: {turn['user_query']}
+                Previous A: {previous_response[:200]}{'...' if len(previous_response) > 200 else ''}
+                """)
+        
+        if relevant_contexts:
+            return "Based on our previous conversation:\n" + "\n".join(relevant_contexts)
+        
+        return ""
+    
+    def _calculate_query_similarity(self, query1: str, query2: str) -> float:
+        """Calculate simple similarity between two queries"""
+        # Simple word overlap similarity
+        words1 = set(query1.split())
+        words2 = set(query2.split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = words1.intersection(words2)
+        union = words1.union(words2)
+        
+        return len(intersection) / len(union)
+    
     def _generate_response(self, context: str, user_query: str) -> str:
         """Generate response using OpenAI with optimized context"""
         try:
+            # Get conversation history for better context
+            session_id = self.session_manager.get_or_create_session_id()
+            conversation_history = self.session_manager.get_conversation_history(session_id)
+            
+            # Build conversation history messages
+            messages = [
+                {"role": "system", "content": "You are a helpful data analyst assistant. The data you are looking at is advertising spend data related to marketing campaigns. Sometimes the data is spread across multiple sheets. Your job is to identify helpful information and insights across all of the sheets. When there are multiple sheets, consider information from all of the sheets before giving a response. Be concise and focused on the specific query. If the user asks a similar question to what you've answered before, reference your previous response and build upon it."}
+            ]
+            
+            # Add recent conversation history (last 2 turns) for context
+            if conversation_history:
+                recent_turns = conversation_history[-2:]  # Last 2 turns
+                for turn in recent_turns:
+                    messages.append({"role": "user", "content": turn['user_query']})
+                    messages.append({"role": "assistant", "content": turn['assistant_response']})
+            
+            # Add current context and query
+            messages.append({"role": "user", "content": f"{context}\n\nUser Query: {user_query}"})
+            
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful data analyst assistant. The data you are looking at is advertising spend data related to marketing campaigns. Sometimes the data is spread across multiple sheets. Your job is to identify helpful information and insights across all of the sheets. When there are multiple sheets, consider information from all of the sheets before giving a response. Be concise and focused on the specific query."},
-                    {"role": "user", "content": f"{context}\n\nUser Query: {user_query}"}
-                ],
+                messages=messages,
                 max_tokens=1500,
                 temperature=0.7
             )
@@ -1605,6 +1896,42 @@ def main():
         st.session_state.app = CSVChatApp()
 
     app = st.session_state.app
+    
+    # Initialize session management
+    session_id = app.session_manager.get_or_create_session_id()
+    
+    # Display session information in sidebar
+    with st.sidebar:
+        st.header("🆔 Session Info")
+        st.info(f"**Session ID:** {session_id[:8]}...")
+        
+        # Show session metadata
+        session_metadata = app.session_manager.get_session_metadata(session_id)
+        if session_metadata:
+            st.write(f"**Created:** {session_metadata.get('created_at', 'Unknown')[:19]}")
+            st.write(f"**Last Activity:** {session_metadata.get('last_activity', 'Unknown')[:19]}")
+            st.write(f"**Total Turns:** {session_metadata.get('total_turns', 0)}")
+        
+        # Show conversation history
+        conversation_history = app.session_manager.get_conversation_history(session_id)
+        if conversation_history:
+            with st.expander(f"📝 Conversation History ({len(conversation_history)} turns)"):
+                for i, turn in enumerate(conversation_history[-5:], 1):  # Show last 5 turns
+                    st.write(f"**Turn {i}:**")
+                    st.write(f"**Q:** {turn['user_query'][:100]}{'...' if len(turn['user_query']) > 100 else ''}")
+                    st.write(f"**A:** {turn['assistant_response'][:100]}{'...' if len(turn['assistant_response']) > 100 else ''}")
+                    st.write(f"**Time:** {turn['timestamp'][:19]}")
+                    st.write("---")
+        
+        # Clear session button
+        if st.button("🗑️ Clear Session"):
+            if app.session_manager.delete_session(session_id):
+                st.success("Session cleared successfully!")
+                # Generate new session ID
+                st.session_state.session_id = app.session_manager.generate_session_id()
+                st.rerun()
+            else:
+                st.error("Failed to clear session")
 
     # Sidebar for file upload
     with st.sidebar:
