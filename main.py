@@ -451,8 +451,20 @@ class CSVChatApp:
                         collection_name="csv_data"
                     )
                 except Exception as db_error:
-                    # Only clear database if there's a database error
-                    if "Database error" in str(db_error) or "no such table" in str(db_error):
+                    # Handle read-only database errors gracefully
+                    if "readonly" in str(db_error).lower() or "code: 1032" in str(db_error):
+                        st.warning("Database is read-only. Using existing data.")
+                        # Try to use existing database without clearing
+                        try:
+                            self.vectorstore = Chroma(
+                                persist_directory="./chroma_db",
+                                embedding_function=self.embeddings,
+                                collection_name="csv_data"
+                            )
+                        except:
+                            st.error("Could not access database. Please restart the app.")
+                            self.vectorstore = None
+                    elif "Database error" in str(db_error) or "no such table" in str(db_error):
                         st.warning("Database corrupted, clearing and recreating...")
                         import shutil
                         if os.path.exists("./chroma_db"):
@@ -499,10 +511,8 @@ class CSVChatApp:
                 metadata={"hnsw:space": "cosine"}
             )
             
-            # Clear existing data
-            self.collection.delete(where={})
-            
-            st.success("ChromaDB collection initialized and cleared")
+            # Don't clear existing data - let it accumulate
+            # This prevents read-only database errors
             
         except Exception as e:
             st.error(f"Error setting up ChromaDB: {str(e)}")
@@ -511,7 +521,10 @@ class CSVChatApp:
     def clear_vectorstore(self):
         """Clear the LangChain vectorstore by recreating it"""
         try:
-            # Clean up any existing chroma directories
+            # Reset vectorstore reference
+            self.vectorstore = None
+            
+            # Try to clean up any existing chroma directories
             import shutil
             import os
             
@@ -523,18 +536,17 @@ class CSVChatApp:
                         else:
                             os.remove(item)
                     except Exception as cleanup_error:
-                        st.warning(f"Could not clean up {item}: {str(cleanup_error)}")
-            
-            # Reset vectorstore
-            self.vectorstore = None
+                        # Don't show warning for read-only errors, just continue
+                        pass
             
             # Recreate the vectorstore
             self.setup_langchain()
             
-            st.success("Vectorstore cleared and recreated")
-            
         except Exception as e:
-            st.error(f"Error clearing vectorstore: {str(e)}")
+            # If we can't clear the vectorstore, just reset the reference
+            # This allows the app to continue working
+            self.vectorstore = None
+            st.warning("Could not clear vector database, but app will continue to work.")
 
     def reset_session(self):
         """Reset current session while keeping Redis records"""
@@ -2691,7 +2703,7 @@ def main():
     # Initialize session management
     session_id = app.session_manager.get_or_create_session_id()
     
-    # Display session information in sidebar
+    # Combined sidebar for all sidebar content
     with st.sidebar:
         st.header("🆔 Session Info")
         st.info(f"**Session ID:** {session_id[:8]}...")
@@ -2724,8 +2736,62 @@ def main():
             else:
                 st.error("Failed to clear session")
 
-    # Sidebar for session management and configuration only
-    with st.sidebar:
+
+        # Upload more data toggle (only show when data is already loaded)
+        if app.dfs or app.text_files:
+            with st.expander("📁 Upload More Data", expanded=False):
+                st.markdown("Upload additional CSV, Excel, or text files.")
+                
+                additional_files = st.file_uploader(
+                    "Choose additional files",
+                    type=['csv', 'xlsx', 'xls', 'txt'],
+                    accept_multiple_files=True,
+                    help="Upload additional CSV, Excel, or text files.",
+                    key="additional_uploader"
+                )
+
+                if additional_files:
+                    # Process files one by one with better error handling
+                    for uploaded_file in additional_files:
+                        try:
+                            # Check if this file has already been processed
+                            file_already_processed = uploaded_file.name in app.processed_files
+                            
+                            if not file_already_processed:
+                                st.info(f"Processing {uploaded_file.name}...")
+                                
+                                # Determine file type and process accordingly
+                                if uploaded_file.name.lower().endswith('.csv'):
+                                    df = app.process_csv(uploaded_file, uploaded_file.name)
+                                    if df is not None:
+                                        st.success(f"✅ {uploaded_file.name} processed!")
+                                    else:
+                                        st.error(f"❌ Failed to process {uploaded_file.name}")
+                                        
+                                elif uploaded_file.name.lower().endswith(('.xlsx', '.xls')):
+                                    df = app.process_excel(uploaded_file, uploaded_file.name)
+                                    if df is not None:
+                                        st.success(f"✅ {uploaded_file.name} processed!")
+                                    else:
+                                        st.error(f"❌ Failed to process {uploaded_file.name}")
+                                        
+                                elif uploaded_file.name.lower().endswith('.txt'):
+                                    success = app.process_text_file(uploaded_file, uploaded_file.name)
+                                    if success:
+                                        st.success(f"✅ Text file '{uploaded_file.name}' processed!")
+                                    else:
+                                        st.error(f"❌ Failed to process text file '{uploaded_file.name}'")
+                                else:
+                                    st.error(f"❌ Unsupported file type: {uploaded_file.name}")
+                            else:
+                                st.info(f"✅ {uploaded_file.name} already processed")
+                                
+                        except Exception as e:
+                            st.error(f"❌ Error processing {uploaded_file.name}: {str(e)}")
+                    
+                    # Show completion message without rerun
+                    st.success("🎉 File processing complete!")
+        
         # Show loaded datasets
         if app.dfs or app.text_files:
             st.header("📊 Loaded Datasets")
