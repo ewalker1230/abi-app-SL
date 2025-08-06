@@ -735,7 +735,7 @@ class CSVChatApp:
 
             {quality_summary}
 
-            Please provide a comprehensive quality assessment including:
+            Please provide a concise quality assessment addressing each of the below in one sentence:
             1. Critical quality issues that need immediate attention
             2. Potential data integrity problems
             3. Recommendations for data cleaning
@@ -816,7 +816,9 @@ class CSVChatApp:
                 column_info += f"\nSample categorical info for {col}: {unique_count} unique values"
             
             prompt = f"""
-            Based on this dataset, generate 8-10 intelligent and specific questions that a data analyst would want to ask.
+            Based on this dataset, generate 3 intelligent and specific questions that a data analyst would want to ask. 
+
+            Keep the prompts short and concise
 
             Dataset Information:
             {data_summary}
@@ -945,22 +947,21 @@ class CSVChatApp:
                 return "No data available for analysis. Please upload some files first."
             
             prompt = f"""
-            Analyze all the data in this session's vector database and provide comprehensive insights. 
+            Analyze all the data in this session's vector database and provide three short concise insights. 
             Focus on patterns, relationships, and insights across all datasets.
 
             All Session Data:
             {all_data}
 
-            Please provide 5-7 intelligent insights about:
+            Please provide three concise intelligent insights from the following list:
             1. Cross-dataset patterns and relationships
-            2. Overall data quality and consistency
-            3. Key themes and trends across all data
-            4. Potential business insights or opportunities
-            5. Recommendations for further analysis
-            6. Data integration opportunities
-            7. Anomalies or interesting findings
+            2. Key themes and trends across all data
+            3. Potential business insights or opportunities
+            4. Recommendations for further analysis
+            5. Data integration opportunities
+            6. Anomalies or interesting findings
 
-            Format your response as a clear, professional analysis with bullet points.
+            Format your response as a clear, professional analysis with three bullet points.
             Focus on insights that span across multiple datasets rather than individual file analysis.
             """
             
@@ -1013,11 +1014,9 @@ class CSVChatApp:
             Please provide a comprehensive quality assessment including:
             1. Overall data quality score and summary
             2. Cross-dataset consistency issues
-            3. Data integration challenges
-            4. Quality problems that affect analysis
-            5. Recommendations for data cleaning and standardization
-            6. Potential data governance issues
-            7. Impact assessment on business intelligence
+            3. Quality problems that affect analysis
+            4. Recommendations for data cleaning and standardization
+            5. Impact assessment on business intelligence
 
             Focus on quality issues that span across multiple datasets and affect overall analysis quality.
             Format your response as a professional quality assessment report.
@@ -2687,11 +2686,11 @@ def main():
     )
 
     # Compact header with smaller logo and inline description
-    col1 , col2= st.columns([1, 3])
+    col1 , col2= st.columns([1, 1])
     with col1:
-        st.image("assets/abi_horiizontal_lime.png", width=200)
-    with col2:
-        st.markdown("### Upload documents are start gathering insights")
+        st.image("assets/abi_horiizontal_lime.png", width=300)
+    # with col2:
+    #     st.markdown("### Upload documents are start gathering insights")
   
 
     # Initialize app
@@ -2938,15 +2937,15 @@ def main():
     # Main content area
     if not (app.dfs or app.text_files):
         # Upload section when no data is loaded
-        st.header("📁 Upload Your Data")
-        st.markdown("Upload CSV, Excel, or text files to start analyzing your data with AI.")
+        st.header("📁 Add Your Data")
+        st.markdown("Choose Excel or text files to start analyzing with AI.")
         
         # Unified file uploader
         uploaded_files = st.file_uploader(
-            "Choose files to upload",
-            type=['csv', 'xlsx', 'xls', 'txt'],
+            "Select files",
+            type=['xlsx', 'xls', 'txt'],
             accept_multiple_files=True,
-            help="Upload CSV, Excel, or text files. All file types will be processed automatically."
+            help="Excel and text files will be processed automatically."
         )
 
         if uploaded_files:
@@ -2992,7 +2991,7 @@ def main():
             
             # Show a success message and prompt to start chatting
             if uploaded_files:
-                st.success("🎉 Files uploaded successfully! You can now start chatting with your data.")
+                st.success("🎉 Files processed! You can now start chatting with your data.")
                 st.markdown("---")
     
     # Main chat interface
@@ -3008,31 +3007,57 @@ def main():
             st.warning("⚠️ OpenAI API key not found. AI agents require an OpenAI API key to function.")
             st.info("Please add your OpenAI API key to the .env file to enable AI analysis.")
         else:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if st.button("🧠 Analyze All Data", help="Get comprehensive insights across all datasets"):
+            # Single column layout for AI agent buttons
+            if st.button("🧠 Analyze All Data", help="Get comprehensive insights across all datasets"):
+                # Add user message to chat history
+                user_msg = "🧠 Analyze All Data"
+                st.session_state.messages.append({"role": "user", "content": user_msg})
+                with st.chat_message("user"):
+                    st.markdown(user_msg)
+                
+                # Generate and display response in chat
+                with st.chat_message("assistant"):
                     with st.spinner("🤖 AI Agent analyzing all data..."):
                         analysis_result = app.llm_analyze_all_data()
-                        st.success("✅ Analysis Complete!")
-                        with st.expander("🧠 AI Data Analysis Results", expanded=True):
-                            st.markdown(analysis_result)
+                        st.markdown(analysis_result)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": analysis_result})
+                st.rerun()
             
-            with col2:
-                if st.button("🔍 Quality Assessment", help="Assess data quality across all datasets"):
+            if st.button("🔍 Quality Assessment", help="Assess data quality across all datasets"):
+                # Add user message to chat history
+                user_msg = "🔍 Quality Assessment"
+                st.session_state.messages.append({"role": "user", "content": user_msg})
+                with st.chat_message("user"):
+                    st.markdown(user_msg)
+                
+                # Generate and display response in chat
+                with st.chat_message("assistant"):
                     with st.spinner("🤖 AI Agent checking data quality..."):
                         quality_result = app.llm_quality_check_all_data()
-                        st.success("✅ Quality Assessment Complete!")
-                        with st.expander("🔍 AI Quality Assessment Results", expanded=True):
-                            st.markdown(quality_result)
+                        st.markdown(quality_result)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": quality_result})
+                st.rerun()
             
-            with col3:
-                if st.button("💡 Query Suggestions", help="Get intelligent query suggestions for all data"):
+            if st.button("💡 Query Suggestions", help="Get intelligent query suggestions for all data"):
+                # Add user message to chat history
+                user_msg = "💡 Query Suggestions"
+                st.session_state.messages.append({"role": "user", "content": user_msg})
+                with st.chat_message("user"):
+                    st.markdown(user_msg)
+                
+                # Generate and display response in chat
+                with st.chat_message("assistant"):
                     with st.spinner("🤖 AI Agent generating query suggestions..."):
                         suggestions_result = app.llm_suggest_queries_all_data()
-                        st.success("✅ Query Suggestions Complete!")
-                        with st.expander("💡 AI Query Suggestions", expanded=True):
-                            st.markdown(suggestions_result)
+                        st.markdown(suggestions_result)
+                
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": suggestions_result})
+                st.rerun()
         
         st.markdown("---")
 
