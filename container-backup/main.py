@@ -743,32 +743,8 @@ class CSVChatApp:
     def process_csv(self, uploaded_file, filename: str) -> pd.DataFrame:
         """Process uploaded CSV file and return DataFrame"""
         try:
-            # Read CSV file with better error handling
-            try:
-                # First try with default settings
-                df = pd.read_csv(uploaded_file)
-            except Exception as csv_error:
-                # If that fails, try with more robust settings
-                uploaded_file.seek(0)  # Reset file pointer
-                df = pd.read_csv(
-                    uploaded_file,
-                    engine='python',  # Use python engine instead of C
-                    on_bad_lines='skip',  # Skip problematic lines
-                    low_memory=False,  # Avoid memory issues
-                    dtype=str  # Read all columns as strings initially
-                )
-            
-            # Clean up the dataframe
-            df = df.dropna(how='all')  # Remove completely empty rows
-            df = df.fillna('')  # Replace NaN with empty strings
-            
-            # Convert problematic columns to string to avoid type issues
-            for col in df.columns:
-                try:
-                    df[col] = df[col].astype(str)
-                except:
-                    # If conversion fails, keep as object
-                    pass
+            # Read CSV file
+            df = pd.read_csv(uploaded_file)
             
             # Store in memory
             self.dfs[filename] = df
@@ -788,35 +764,13 @@ class CSVChatApp:
     def process_excel(self, uploaded_file, filename: str):
         """Process uploaded Excel file and return DataFrame"""
         try:
-            # Read Excel file with better error handling
-            try:
-                df = pd.read_excel(uploaded_file, sheet_name=None)
-            except Exception as excel_error:
-                # If that fails, try with more robust settings
-                uploaded_file.seek(0)  # Reset file pointer
-                df = pd.read_excel(
-                    uploaded_file, 
-                    sheet_name=None,
-                    engine='openpyxl',  # Use openpyxl engine
-                    dtype=str  # Read all columns as strings initially
-                )
+            # Read Excel file
+            df = pd.read_excel(uploaded_file, sheet_name=None)
             
             # If multiple sheets, process each one
             if isinstance(df, dict):
                 processed_sheets = {}
                 for sheet_name, sheet_df in df.items():
-                    # Clean up the sheet dataframe
-                    sheet_df = sheet_df.dropna(how='all')  # Remove completely empty rows
-                    sheet_df = sheet_df.fillna('')  # Replace NaN with empty strings
-                    
-                    # Convert problematic columns to string to avoid type issues
-                    for col in sheet_df.columns:
-                        try:
-                            sheet_df[col] = sheet_df[col].astype(str)
-                        except:
-                            # If conversion fails, keep as object
-                            pass
-                    
                     sheet_filename = f"{filename}_{sheet_name}"
                     processed_sheets[sheet_name] = sheet_df
                     
@@ -835,18 +789,7 @@ class CSVChatApp:
                 
                 return processed_sheets
             else:
-                # Single sheet - clean up the dataframe
-                df = df.dropna(how='all')  # Remove completely empty rows
-                df = df.fillna('')  # Replace NaN with empty strings
-                
-                # Convert problematic columns to string to avoid type issues
-                for col in df.columns:
-                    try:
-                        df[col] = df[col].astype(str)
-                    except:
-                        # If conversion fails, keep as object
-                        pass
-                
+                # Single sheet
                 self.dfs[filename] = df
                 
                 # Store as single sheet in excel_sheets
