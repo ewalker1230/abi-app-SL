@@ -14,7 +14,7 @@ from datetime import datetime
 
 # LangChain imports
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
 # Load environment variables
@@ -368,15 +368,16 @@ class CSVChatApp:
         try:
             # Ensure chroma_db directory exists
             import os
-            os.makedirs("./chroma_db", exist_ok=True)
+            import shutil
+            import time
             
             # Initialize text splitter first (doesn't require API key)
             if self.text_splitter is None:
                 self.text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500,
-                    chunk_overlap=50,
+                    chunk_size=1000,  # Increased from 500 to handle longer data rows
+                    chunk_overlap=100,  # Increased overlap for better context
                     length_function=len,
-                    separators=["\n\n", "\n", " ", ""],
+                    separators=["\n\n", "\n", " | ", " ", ""],  # Added " | " as separator for data rows
                     keep_separator=True
                 )
             
@@ -398,46 +399,14 @@ class CSVChatApp:
                         collection_name="csv_data"
                     )
                 except Exception as db_error:
+                    error_msg = str(db_error).lower()
                     # Handle read-only database errors gracefully
-                    if "readonly" in str(db_error).lower() or "code: 1032" in str(db_error):
+                    if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
                         st.warning("Database is read-only. Clearing and recreating...")
-                        # Clear the corrupted database
-                        import shutil
-                        if os.path.exists("./chroma_db"):
-                            try:
-                                shutil.rmtree("./chroma_db")
-                            except:
-                                pass
-                        os.makedirs("./chroma_db", exist_ok=True)
-                        
-                        # Try again with fresh database
-                        try:
-                            self.vectorstore = Chroma(
-                                persist_directory="./chroma_db",
-                                embedding_function=self.embeddings,
-                                collection_name="csv_data"
-                            )
-                            st.success("✅ Database recreated successfully!")
-                        except Exception as recreate_error:
-                            st.error(f"❌ Could not recreate database: {str(recreate_error)}")
-                            self.vectorstore = None
-                    elif "Database error" in str(db_error) or "no such table" in str(db_error):
+                        self._recreate_database()
+                    elif "database error" in error_msg or "no such table" in error_msg:
                         st.warning("Database corrupted, clearing and recreating...")
-                        import shutil
-                        if os.path.exists("./chroma_db"):
-                            try:
-                                shutil.rmtree("./chroma_db")
-                            except:
-                                pass
-                        os.makedirs("./chroma_db", exist_ok=True)
-                        
-                        # Try again with fresh database
-                        self.vectorstore = Chroma(
-                            persist_directory="./chroma_db",
-                            embedding_function=self.embeddings,
-                            collection_name="csv_data"
-                        )
-                        st.success("Database recreated successfully!")
+                        self._recreate_database()
                     else:
                         # Re-raise other errors
                         raise db_error
@@ -446,6 +415,75 @@ class CSVChatApp:
             st.error(f"Error setting up LangChain: {str(e)}")
             self.embeddings = None
             self.text_splitter = None
+            self.vectorstore = None
+
+    def _test_database_connection(self):
+        """Test if the database connection is working"""
+        try:
+            if not self.vectorstore:
+                return False
+            
+            # Try a simple operation to test the connection
+            test_docs = self.vectorstore.similarity_search("test", k=1)
+            return True
+        except Exception as e:
+            st.warning(f"Database connection test failed: {str(e)}")
+            return False
+
+    def _recreate_database(self):
+        """Helper function to recreate the database"""
+        import os
+        import shutil
+        import time
+        
+        try:
+            # Clear the corrupted database
+            if os.path.exists("./chroma_db"):
+                try:
+                    # Force remove the directory with multiple attempts
+                    for attempt in range(3):
+                        try:
+                            shutil.rmtree("./chroma_db", ignore_errors=True)
+                            time.sleep(1)  # Give OS time to release file handles
+                            break
+                        except Exception as e:
+                            if attempt < 2:  # Not the last attempt
+                                time.sleep(2)  # Wait longer before retry
+                                continue
+                            else:
+                                st.warning(f"Could not remove old database on final attempt: {str(e)}")
+                except Exception as e:
+                    st.warning(f"Could not remove old database: {str(e)}")
+            
+            # Create fresh directory
+            try:
+                os.makedirs("./chroma_db", exist_ok=True)
+                time.sleep(0.5)  # Give OS time to create directory
+            except Exception as e:
+                st.error(f"Could not create new database directory: {str(e)}")
+                self.vectorstore = None
+                return
+            
+            # Try to recreate vectorstore
+            try:
+                self.vectorstore = Chroma(
+                    persist_directory="./chroma_db",
+                    embedding_function=self.embeddings,
+                    collection_name="csv_data"
+                )
+                
+                # Test the connection
+                if self._test_database_connection():
+                    st.success("✅ Database recreated successfully!")
+                else:
+                    st.warning("⚠️ Database recreated but connection test failed")
+                    
+            except Exception as recreate_error:
+                st.error(f"❌ Could not recreate database: {str(recreate_error)}")
+                self.vectorstore = None
+                
+        except Exception as e:
+            st.error(f"❌ Error recreating database: {str(e)}")
             self.vectorstore = None
 
     def setup_chroma(self):
@@ -489,15 +527,19 @@ class CSVChatApp:
                 if item.startswith("chroma_db"):
                     try:
                         if os.path.isdir(item):
-                            shutil.rmtree(item)
+                            shutil.rmtree(item, ignore_errors=True)
                         else:
                             os.remove(item)
                     except Exception as cleanup_error:
                         # Don't show warning for read-only errors, just continue
                         pass
             
-            # Recreate the vectorstore
-            self.setup_langchain()
+            # Recreate the vectorstore using the helper function
+            if self.embeddings is not None:
+                self._recreate_database()
+            else:
+                # If no embeddings, just recreate the directory
+                os.makedirs("./chroma_db", exist_ok=True)
             
         except Exception as e:
             # If we can't clear the vectorstore, just reset the reference
@@ -563,23 +605,44 @@ class CSVChatApp:
         try:
             session_id = self.session_manager.get_or_create_session_id()
             
-            # Get all data summaries
-            data_summaries = []
+            # Check if vectorstore has data
+            if not self.vectorstore:
+                return "No data has been processed and stored yet. Please upload some files first."
             
-            # Add CSV datasets
-            for filename, df in self.dfs.items():
-                data_summaries.append(f"📊 {filename}: {df.shape[0]} rows, {df.shape[1]} columns")
-                data_summaries.append(f"   Columns: {list(df.columns)}")
-                data_summaries.append(f"   Sample data: {df.head(3).to_string()}")
+            # Get a sample of actual data from the vectorstore
+            try:
+                # Get a sample of documents from the vectorstore
+                sample_docs = self.vectorstore.similarity_search("", k=10)
+                if not sample_docs:
+                    return "No data found in the vectorstore to analyze. Please upload some files first."
+                
+                # Create a summary of the actual data
+                data_summaries = []
+                data_summaries.append("📊 **Data Available in Vector Database:**")
                 data_summaries.append("")
-            
-            # Add text documents
-            for filename in self.text_files:
-                if filename in self.text_contents:
-                    text_content = self.text_contents[filename]
-                    data_summaries.append(f"📄 {filename}: {len(text_content)} characters")
-                    data_summaries.append(f"   Preview: {text_content[:200]}...")
+                
+                # Group documents by filename
+                docs_by_file = {}
+                for doc in sample_docs:
+                    filename = doc.metadata.get('filename', 'Unknown')
+                    if filename not in docs_by_file:
+                        docs_by_file[filename] = []
+                    docs_by_file[filename].append(doc)
+                
+                # Create summaries for each file
+                for filename, docs in docs_by_file.items():
+                    data_summaries.append(f"📄 **{filename}**: {len(docs)} sample records")
+                    # Show a few sample records
+                    for i, doc in enumerate(docs[:3]):
+                        data_summaries.append(f"   Record {i+1}: {doc.page_content[:200]}...")
                     data_summaries.append("")
+                
+                # Add information about total data
+                data_summaries.append(f"💾 **Total Sample Records Analyzed**: {len(sample_docs)}")
+                data_summaries.append("")
+                
+            except Exception as e:
+                return f"Error retrieving data from vectorstore: {str(e)}"
             
             if not data_summaries:
                 return "No data found to analyze. Please upload some files first."
@@ -592,13 +655,14 @@ class CSVChatApp:
             {data_summary_text}
             
             Please provide:
-            1. **Data Overview**: Summary of what data is available
+            1. **Data Overview**: Summary of what data is available and its structure
             2. **Key Patterns**: Notable patterns or trends in the data
             3. **Data Quality**: Assessment of data quality and completeness
             4. **Business Insights**: Potential business value and insights
             5. **Recommendations**: Suggested next steps for analysis
             
             Focus on actionable insights that would be valuable for business decision-making.
+            Use the actual data values provided in the context to give specific, meaningful analysis.
             """
             
             # Get response from LLM
@@ -891,11 +955,22 @@ class CSVChatApp:
             # Convert dataframe to documents
             documents = []
             for idx, row in df.iterrows():
-                # Create document from row
-                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                # Create a more detailed document from row with actual data values
+                row_data = []
+                for col, val in row.items():
+                    # Skip empty values and NaN
+                    if pd.isna(val) or val == '' or str(val).strip() == '' or str(val).lower() == 'nan':
+                        continue
+                    # Format the data properly - ensure we're getting actual values
+                    formatted_val = str(val).strip()
+                    if formatted_val:  # Only add if we have a non-empty value
+                        row_data.append(f"{col}: {formatted_val}")
                 
-                # Only add documents with meaningful content
-                if row_text and row_text.strip():
+                # Only create document if we have meaningful data
+                if row_data:
+                    row_text = " | ".join(row_data)
+                    
+                    # Create document with actual data
                     doc = type('Document', (), {
                         'page_content': row_text,
                         'metadata': {
@@ -951,34 +1026,23 @@ class CSVChatApp:
                 error_msg = str(embedding_error).lower()
                 if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
                     st.warning("Database is read-only. Clearing and recreating...")
-                    # Clear the corrupted database
-                    import shutil
-                    if os.path.exists("./chroma_db"):
-                        try:
-                            shutil.rmtree("./chroma_db")
-                        except:
-                            pass
-                    os.makedirs("./chroma_db", exist_ok=True)
+                    self._recreate_database()
                     
-                    # Recreate vectorstore
-                    try:
-                        self.vectorstore = Chroma(
-                            persist_directory="./chroma_db",
-                            embedding_function=self.embeddings,
-                            collection_name="csv_data"
-                        )
-                        # Try adding documents again
-                        self.vectorstore.add_documents(valid_chunks)
-                        st.success("Database recreated and documents added successfully!")
-                    except Exception as recreate_error:
-                        st.error(f"Could not recreate database: {str(recreate_error)}")
-                        os.remove(temp_path)
-                        return False
+                    # Try adding documents again if database was recreated
+                    if self.vectorstore:
+                        try:
+                            self.vectorstore.add_documents(valid_chunks)
+                            st.success("Database recreated and documents added successfully!")
+                        except Exception as retry_error:
+                            st.error(f"Could not add documents after database recreation: {str(retry_error)}")
+                            return
+                    else:
+                        st.error("Could not recreate database")
+                        return
                 else:
                     st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
                     st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
-                    os.remove(temp_path)
-                    return False
+                    return
             
             # Clean up temp file
             os.remove(temp_path)
@@ -996,11 +1060,22 @@ class CSVChatApp:
             # Convert dataframe to documents
             documents = []
             for idx, row in df.iterrows():
-                # Create document from row
-                row_text = " ".join([f"{col}: {val}" for col, val in row.items()])
+                # Create a more detailed document from row with actual data values
+                row_data = []
+                for col, val in row.items():
+                    # Skip empty values and NaN
+                    if pd.isna(val) or val == '' or str(val).strip() == '' or str(val).lower() == 'nan':
+                        continue
+                    # Format the data properly - ensure we're getting actual values
+                    formatted_val = str(val).strip()
+                    if formatted_val:  # Only add if we have a non-empty value
+                        row_data.append(f"{col}: {formatted_val}")
                 
-                # Only add documents with meaningful content - more lenient
-                if row_text and row_text.strip():
+                # Only create document if we have meaningful data
+                if row_data:
+                    row_text = " | ".join(row_data)
+                    
+                    # Create document with actual data
                     doc = type('Document', (), {
                         'page_content': row_text,
                         'metadata': {
@@ -1052,27 +1127,18 @@ class CSVChatApp:
                 error_msg = str(embedding_error).lower()
                 if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
                     st.warning("Database is read-only. Clearing and recreating...")
-                    # Clear the corrupted database
-                    import shutil
-                    if os.path.exists("./chroma_db"):
-                        try:
-                            shutil.rmtree("./chroma_db")
-                        except:
-                            pass
-                    os.makedirs("./chroma_db", exist_ok=True)
+                    self._recreate_database()
                     
-                    # Recreate vectorstore
-                    try:
-                        self.vectorstore = Chroma(
-                            persist_directory="./chroma_db",
-                            embedding_function=self.embeddings,
-                            collection_name="csv_data"
-                        )
-                        # Try adding documents again
-                        self.vectorstore.add_documents(valid_chunks)
-                        st.success("Database recreated and documents added successfully!")
-                    except Exception as recreate_error:
-                        st.error(f"Could not recreate database: {str(recreate_error)}")
+                    # Try adding documents again if database was recreated
+                    if self.vectorstore:
+                        try:
+                            self.vectorstore.add_documents(valid_chunks)
+                            st.success("Database recreated and documents added successfully!")
+                        except Exception as retry_error:
+                            st.error(f"Could not add documents after database recreation: {str(retry_error)}")
+                            return
+                    else:
+                        st.error("Could not recreate database")
                         return
                 else:
                     st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
@@ -1145,27 +1211,18 @@ class CSVChatApp:
                 error_msg = str(embedding_error).lower()
                 if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
                     st.warning("Database is read-only. Clearing and recreating...")
-                    # Clear the corrupted database
-                    import shutil
-                    if os.path.exists("./chroma_db"):
-                        try:
-                            shutil.rmtree("./chroma_db")
-                        except:
-                            pass
-                    os.makedirs("./chroma_db", exist_ok=True)
+                    self._recreate_database()
                     
-                    # Recreate vectorstore
-                    try:
-                        self.vectorstore = Chroma(
-                            persist_directory="./chroma_db",
-                            embedding_function=self.embeddings,
-                            collection_name="csv_data"
-                        )
-                        # Try adding documents again
-                        self.vectorstore.add_documents(valid_chunks)
-                        st.success("Database recreated and documents added successfully!")
-                    except Exception as recreate_error:
-                        st.error(f"Could not recreate database: {str(recreate_error)}")
+                    # Try adding documents again if database was recreated
+                    if self.vectorstore:
+                        try:
+                            self.vectorstore.add_documents(valid_chunks)
+                            st.success("Database recreated and documents added successfully!")
+                        except Exception as retry_error:
+                            st.error(f"Could not add documents after database recreation: {str(retry_error)}")
+                            return
+                    else:
+                        st.error("Could not recreate database")
                         return
                 else:
                     st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
@@ -1225,6 +1282,10 @@ class CSVChatApp:
                     # Use similarity search
                     docs = self.vectorstore.similarity_search(user_query, k=k)
                     
+                    # Check if documents were found
+                    if not docs:
+                        return "I couldn't find any relevant information in the uploaded data to answer your question. Please make sure you've uploaded the relevant files and try rephrasing your question."
+                    
                     # Build context from documents
                     context_parts = []
                     for doc in docs:
@@ -1281,7 +1342,7 @@ class CSVChatApp:
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[
-                    {"role": "system", "content": "You are a helpful AI assistant that analyzes data and provides insights. Always be accurate and helpful."},
+                    {"role": "system", "content": "You are a helpful AI assistant that analyzes data and provides insights. Always be accurate and helpful. Use the provided context to answer questions. If the context doesn't contain the information needed to answer the question, say so clearly."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=1000,
@@ -1451,6 +1512,124 @@ class CSVChatApp:
             st.error(f"Error creating box chart: {str(e)}")
             return None
 
+    def check_vectorstore_status(self):
+        """Check the current status of the vectorstore and show what data is stored"""
+        try:
+            if not self.vectorstore:
+                return "❌ No vectorstore initialized"
+            
+            # Try to get collection info
+            try:
+                # Get all documents in the vectorstore
+                all_docs = self.vectorstore.get()
+                if all_docs and 'documents' in all_docs:
+                    doc_count = len(all_docs['documents'])
+                    return f"✅ Vectorstore initialized with {doc_count} documents"
+                else:
+                    return "⚠️ Vectorstore initialized but no documents found"
+            except Exception as e:
+                return f"⚠️ Vectorstore initialized but error checking documents: {str(e)}"
+                
+        except Exception as e:
+            return f"❌ Error checking vectorstore: {str(e)}"
+
+    def show_stored_data_preview(self):
+        """Show a preview of the data currently stored in the vectorstore"""
+        try:
+            if not self.vectorstore:
+                st.warning("No vectorstore initialized")
+                return
+            
+            # Try to get a sample of documents
+            try:
+                # Get a few sample documents
+                sample_docs = self.vectorstore.similarity_search("", k=5)
+                if sample_docs:
+                    st.subheader("📊 Data Preview (First 5 documents)")
+                    for i, doc in enumerate(sample_docs):
+                        with st.expander(f"Document {i+1}"):
+                            st.write(f"**Content:** {doc.page_content[:300]}...")
+                            if hasattr(doc, 'metadata') and doc.metadata:
+                                st.write(f"**Metadata:** {doc.metadata}")
+                else:
+                    st.warning("No documents found in vectorstore")
+            except Exception as e:
+                st.error(f"Error retrieving sample documents: {str(e)}")
+                
+        except Exception as e:
+            st.error(f"Error showing data preview: {str(e)}")
+
+    def test_vectorstore_retrieval(self, test_query: str = "test") -> Dict[str, Any]:
+        """Test vectorstore retrieval and return detailed information"""
+        try:
+            if not self.vectorstore:
+                return {"error": "No vectorstore initialized"}
+            
+            # Try to get documents
+            docs = self.vectorstore.similarity_search(test_query, k=5)
+            
+            if not docs:
+                return {"error": "No documents found", "query": test_query}
+            
+            # Analyze the documents
+            doc_info = []
+            for i, doc in enumerate(docs):
+                doc_info.append({
+                    "index": i,
+                    "content_preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                    "content_length": len(doc.page_content),
+                    "metadata": getattr(doc, 'metadata', {})
+                })
+            
+            return {
+                "success": True,
+                "query": test_query,
+                "documents_found": len(docs),
+                "documents": doc_info
+            }
+            
+        except Exception as e:
+            return {"error": f"Error testing vectorstore: {str(e)}"}
+
+    def test_data_processing(self, filename: str = None) -> Dict[str, Any]:
+        """Test data processing and show what's actually being stored"""
+        try:
+            if not self.vectorstore:
+                return {"error": "No vectorstore initialized"}
+            
+            # Get sample documents
+            sample_docs = self.vectorstore.similarity_search("", k=20)
+            if not sample_docs:
+                return {"error": "No documents found in vectorstore"}
+            
+            # Analyze the documents
+            doc_analysis = []
+            for i, doc in enumerate(sample_docs):
+                content = doc.page_content
+                metadata = getattr(doc, 'metadata', {})
+                
+                # Count data fields (separated by " | ")
+                data_fields = content.split(" | ") if " | " in content else [content]
+                
+                doc_analysis.append({
+                    "index": i,
+                    "content_length": len(content),
+                    "data_fields_count": len(data_fields),
+                    "content_preview": content[:300] + "..." if len(content) > 300 else content,
+                    "metadata": metadata,
+                    "has_actual_data": any(":" in field for field in data_fields)
+                })
+            
+            return {
+                "success": True,
+                "total_documents": len(sample_docs),
+                "documents": doc_analysis,
+                "sample_content": sample_docs[0].page_content if sample_docs else "No content"
+            }
+            
+        except Exception as e:
+            return {"error": f"Error testing data processing: {str(e)}"}
+
 def main():
     st.set_page_config(
         page_title="ABI - Agentic Business Intelligence",
@@ -1582,163 +1761,77 @@ def main():
                     
                     st.success("All data cleared!")
                     st.rerun()
-                
-                # Show CSV datasets and Excel files
-                for filename, df in app.dfs.items():
-                    # Check if this is an Excel file with multiple sheets
-                    if filename in app.excel_sheets and len(app.excel_sheets[filename]) > 1:
-                        # This is an Excel file with multiple sheets
-                        with st.expander(f"📊 {filename} (Excel - {len(app.excel_sheets[filename])} sheets)"):
-                            # Show all sheets
-                            for sheet_name, sheet_df in app.excel_sheets[filename].items():
-                                st.write(f"**Sheet: {sheet_name}**")
-                                st.dataframe(sheet_df.head(10000))
-                                st.write("---")
-                            
-                            # Add remove button for the entire Excel file
-                            if st.button(f"❌ Remove {filename}", key=f"remove_excel_{filename}"):
-                                # Remove from memory
-                                del app.dfs[filename]
-                                if filename in app.excel_sheets:
-                                    del app.excel_sheets[filename]
-                                
-                                # Remove from processed files tracking
-                                for processed_file in list(app.processed_files):
-                                    if processed_file.startswith(filename):
-                                        app.processed_files.remove(processed_file)
-                                
-                                # Note: LangChain Chroma doesn't support direct deletion by metadata
-                                # The document will remain in the vectorstore but won't be accessible
-                                # through the app interface
-                                st.info(f"Removed {filename} from memory. Note: Vector embeddings remain in database.")
-                                
-                                st.rerun()
-                    else:
-                        # This is a CSV or single-sheet Excel file
-                        with st.expander(f"📊 {filename} ({len(df)} rows)"):
-                            st.dataframe(df.head(10000))
-                            
-                            # Add remove button for individual datasets
-                            if st.button(f"❌ Remove {filename}", key=f"remove_csv_{filename}"):
-                                # Remove from memory
-                                del app.dfs[filename]
-                                if filename in app.excel_sheets:
-                                    del app.excel_sheets[filename]
-                                
-                                # Remove from processed files tracking
-                                if filename in app.processed_files:
-                                    app.processed_files.remove(filename)
-                                
-                                # Note: LangChain Chroma doesn't support direct deletion by metadata
-                                # The document will remain in the vectorstore but won't be accessible
-                                # through the app interface
-                                st.info(f"Removed {filename} from memory. Note: Vector embeddings remain in database.")
-                                
-                                st.rerun()
-                
-                # Show text files
-                for filename in app.text_files:
-                    with st.expander(f"📄 {filename}"):
-                        st.write(f"**Type:** Text Document")
-                        st.write(f"**Status:** Indexed in vector database")
-                        
-                        # Show text preview
-                        if filename in app.text_contents:
-                            text_content = app.text_contents[filename]
-                            # Count chunks (approximate)
-                            chunk_count = len(text_content) // 1000 + 1
-                            st.write(f"**Chunks:** {chunk_count} chunks indexed")
-                            
-                            # Show preview (first 500 characters)
-                            preview_length = 500
-                            preview_text = text_content[:preview_length]
-                            if len(text_content) > preview_length:
-                                preview_text += "..."
-                            
-                            st.write("**Preview:**")
-                            st.text_area("", value=preview_text, height=150, disabled=True, key=f"preview_{filename}")
-                            
-                            # Show full document button
-                            if st.button(f"📖 View Full Document", key=f"view_full_{filename}"):
-                                st.session_state[f"show_full_{filename}"] = not st.session_state.get(f"show_full_{filename}", False)
-                            
-                            # Show full document if requested
-                            if st.session_state.get(f"show_full_{filename}", False):
-                                st.markdown("---")
-                                st.markdown("### 📖 Full Document Content")
-                                st.text_area("", value=text_content, height=400, disabled=True, key=f"full_{filename}")
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write(f"**Document Length:** {len(text_content)} characters")
-                                with col2:
-                                    st.write(f"**Estimated Chunks:** {len(text_content) // 1000 + 1}")
-                                st.markdown("---")
-                        
-                        # Add remove button for text files
-                        if st.button(f"❌ Remove {filename}", key=f"remove_text_{filename}"):
-                            # Remove from tracking
-                            app.text_files.remove(filename)
-                            if filename in app.text_contents:
-                                del app.text_contents[filename]
-                            
-                            # Remove from processed files tracking
-                            if filename in app.processed_files:
-                                app.processed_files.remove(filename)
-                            
-                            # Note: LangChain Chroma doesn't support direct deletion by metadata
-                            # The document will remain in the vectorstore but won't be accessible
-                            # through the app interface
-                            st.info(f"Removed {filename} from memory. Note: Vector embeddings remain in database.")
-                            
-                            st.rerun()
-
-        # Session Management
-        st.header("🆔 Session Management")
         
-        # Show current session info
-        current_session_id = app.session_manager.get_or_create_session_id()
-        st.info(f"**Current Session**: {current_session_id[:8]}...")
-        
-        # Session history
-        with st.expander("📚 Session History"):
-            history_summary = app.get_session_history_summary()
-            st.write(history_summary)
+        # Debug section
+        with st.expander("🔧 Debug & Troubleshooting", expanded=False):
+            st.header("🔧 Debug Information")
             
-            # Show detailed history
-            all_sessions = app.session_manager.get_all_sessions()
-            if all_sessions:
-                st.subheader("Detailed History")
-                for session in all_sessions[:3]:  # Show last 3 sessions
-                    # Get interaction count safely
-                    interaction_count = session.get('total_turns', 0)
-                    
-                    # Use a container instead of nested expander
-                    with st.container():
-                        st.markdown(f"**Session {session['session_id'][:8]}... ({interaction_count} interactions)**")
-                        st.write(f"**Last Activity**: {session.get('last_activity', 'Unknown')}")
-                        st.write(f"**Interactions**: {interaction_count}")
+            # Check vectorstore status
+            vectorstore_status = app.check_vectorstore_status()
+            st.info(vectorstore_status)
+            
+            # Show data preview if available
+            if "vectorstore" in vectorstore_status and "documents" in vectorstore_status:
+                if st.button("👁️ Show Data Preview"):
+                    app.show_stored_data_preview()
+            
+            # Test query button
+            if st.button("🧪 Test Query"):
+                test_query = "test"
+                st.info(f"Testing query: '{test_query}'")
+                try:
+                    test_result = app.test_vectorstore_retrieval(test_query)
+                    if "error" in test_result:
+                        st.error(f"❌ {test_result['error']}")
+                    else:
+                        st.success(f"✅ Found {test_result['documents_found']} documents for test query")
+                        for doc_info in test_result['documents'][:3]:
+                            st.write(f"**Doc {doc_info['index']+1}:** {doc_info['content_preview']}")
+                            if doc_info['metadata']:
+                                st.write(f"   Metadata: {doc_info['metadata']}")
+                except Exception as e:
+                    st.error(f"❌ Test query failed: {str(e)}")
+            
+            # Test data processing button
+            if st.button("🔍 Test Data Processing"):
+                st.info("Testing data processing and storage...")
+                try:
+                    test_result = app.test_data_processing()
+                    if "error" in test_result:
+                        st.error(f"❌ {test_result['error']}")
+                    else:
+                        st.success(f"✅ Found {test_result['total_documents']} documents in vectorstore")
+                        st.write(f"**Sample Content:** {test_result['sample_content'][:200]}...")
                         
-                        # Show conversation history for this session
-                        conversation = app.session_manager.get_conversation_history(session['session_id'])
-                        if conversation:
-                            st.write("**Recent Interactions**:")
-                            for turn in conversation[-3:]:  # Show last 3 interactions
-                                timestamp = turn.get('timestamp', 'Unknown')[:19] if turn.get('timestamp') else 'Unknown'
-                                user_query = turn.get('user_query', 'No query')[:50] + '...' if turn.get('user_query') else 'No query'
-                                st.write(f"- **{timestamp}**: {user_query}")
-        
-        # Reset session button
-        if st.button("🔄 Reset Session"):
-            app.reset_session()
-            st.rerun()
-        
-        # Configuration info
-        st.header("🔑 Configuration")
-        if os.getenv("OPENAI_API_KEY"):
-            st.success("✅ OpenAI API Key configured")
-        else:
-            st.error("❌ OpenAI API Key not found in .env file")
-            st.info("Please add OPENAI_API_KEY to your .env file")
+                        # Show analysis of first few documents
+                        for doc_analysis in test_result['documents'][:3]:
+                            st.write(f"**Doc {doc_analysis['index']+1}:** {doc_analysis['data_fields_count']} fields, {doc_analysis['content_length']} chars")
+                            st.write(f"   Preview: {doc_analysis['content_preview']}")
+                            if doc_analysis['has_actual_data']:
+                                st.write("   ✅ Contains actual data")
+                            else:
+                                st.write("   ⚠️ May not contain actual data")
+                except Exception as e:
+                    st.error(f"❌ Data processing test failed: {str(e)}")
+            
+            # Force refresh vectorstore
+            if st.button("🔄 Refresh Vectorstore"):
+                try:
+                    app.setup_langchain()
+                    st.success("✅ Vectorstore refreshed")
+                except Exception as e:
+                    st.error(f"❌ Failed to refresh vectorstore: {str(e)}")
+            
+            # Manual database reset button
+            if st.button("🗑️ Force Reset Database"):
+                st.warning("This will completely clear and recreate the database. All stored data will be lost.")
+                if st.button("⚠️ Confirm Reset", key="confirm_reset"):
+                    try:
+                        app.clear_vectorstore()
+                        st.success("✅ Database reset complete! You may need to re-upload your files.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Failed to reset database: {str(e)}")
 
     # Main content area
     if not (app.dfs or app.text_files):
