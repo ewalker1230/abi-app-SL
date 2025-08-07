@@ -453,16 +453,26 @@ class CSVChatApp:
                 except Exception as db_error:
                     # Handle read-only database errors gracefully
                     if "readonly" in str(db_error).lower() or "code: 1032" in str(db_error):
-                        st.warning("Database is read-only. Using existing data.")
-                        # Try to use existing database without clearing
+                        st.warning("Database is read-only. Clearing and recreating...")
+                        # Clear the corrupted database
+                        import shutil
+                        if os.path.exists("./chroma_db"):
+                            try:
+                                shutil.rmtree("./chroma_db")
+                            except:
+                                pass
+                        os.makedirs("./chroma_db", exist_ok=True)
+                        
+                        # Try again with fresh database
                         try:
                             self.vectorstore = Chroma(
                                 persist_directory="./chroma_db",
                                 embedding_function=self.embeddings,
                                 collection_name="csv_data"
                             )
-                        except:
-                            st.error("Could not access database. Please restart the app.")
+                            st.success("Database recreated successfully!")
+                        except Exception as recreate_error:
+                            st.error(f"Could not recreate database: {str(recreate_error)}")
                             self.vectorstore = None
                     elif "Database error" in str(db_error) or "no such table" in str(db_error):
                         st.warning("Database corrupted, clearing and recreating...")
@@ -1263,9 +1273,35 @@ class CSVChatApp:
                 try:
                     self.vectorstore.add_documents(valid_chunks)
                 except Exception as embedding_error:
-                    st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
-                    st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
-                    return False
+                    error_msg = str(embedding_error).lower()
+                    if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
+                        st.warning("Database is read-only. Clearing and recreating...")
+                        # Clear the corrupted database
+                        import shutil
+                        if os.path.exists("./chroma_db"):
+                            try:
+                                shutil.rmtree("./chroma_db")
+                            except:
+                                pass
+                        os.makedirs("./chroma_db", exist_ok=True)
+                        
+                        # Recreate vectorstore
+                        try:
+                            self.vectorstore = Chroma(
+                                persist_directory="./chroma_db",
+                                embedding_function=self.embeddings,
+                                collection_name="csv_data"
+                            )
+                            # Try adding documents again
+                            self.vectorstore.add_documents(valid_chunks)
+                            st.success("Database recreated and documents added successfully!")
+                        except Exception as recreate_error:
+                            st.error(f"Could not recreate database: {str(recreate_error)}")
+                            return False
+                    else:
+                        st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                        st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                        return False
                 
                 # Clean up temp file
                 os.remove(temp_path)
@@ -1339,9 +1375,35 @@ class CSVChatApp:
             try:
                 self.vectorstore.add_documents(valid_chunks)
             except Exception as embedding_error:
-                st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
-                st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
-                return
+                error_msg = str(embedding_error).lower()
+                if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
+                    st.warning("Database is read-only. Clearing and recreating...")
+                    # Clear the corrupted database
+                    import shutil
+                    if os.path.exists("./chroma_db"):
+                        try:
+                            shutil.rmtree("./chroma_db")
+                        except:
+                            pass
+                    os.makedirs("./chroma_db", exist_ok=True)
+                    
+                    # Recreate vectorstore
+                    try:
+                        self.vectorstore = Chroma(
+                            persist_directory="./chroma_db",
+                            embedding_function=self.embeddings,
+                            collection_name="csv_data"
+                        )
+                        # Try adding documents again
+                        self.vectorstore.add_documents(valid_chunks)
+                        st.success("Database recreated and documents added successfully!")
+                    except Exception as recreate_error:
+                        st.error(f"Could not recreate database: {str(recreate_error)}")
+                        return
+                else:
+                    st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                    st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                    return
             
             st.success(f"Processed {len(valid_chunks)} chunks from {filename} with LangChain")
             
@@ -1404,9 +1466,35 @@ class CSVChatApp:
             try:
                 self.vectorstore.add_documents(valid_chunks)
             except Exception as embedding_error:
-                st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
-                st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
-                return
+                error_msg = str(embedding_error).lower()
+                if "readonly" in error_msg or "code: 1032" in error_msg or "attempt to write a readonly database" in error_msg:
+                    st.warning("Database is read-only. Clearing and recreating...")
+                    # Clear the corrupted database
+                    import shutil
+                    if os.path.exists("./chroma_db"):
+                        try:
+                            shutil.rmtree("./chroma_db")
+                        except:
+                            pass
+                    os.makedirs("./chroma_db", exist_ok=True)
+                    
+                    # Recreate vectorstore
+                    try:
+                        self.vectorstore = Chroma(
+                            persist_directory="./chroma_db",
+                            embedding_function=self.embeddings,
+                            collection_name="csv_data"
+                        )
+                        # Try adding documents again
+                        self.vectorstore.add_documents(valid_chunks)
+                        st.success("Database recreated and documents added successfully!")
+                    except Exception as recreate_error:
+                        st.error(f"Could not recreate database: {str(recreate_error)}")
+                        return
+                else:
+                    st.error(f"Error adding documents to vectorstore: {str(embedding_error)}")
+                    st.error("This might be due to empty embeddings. Check if your OpenAI API key is valid and the content is meaningful.")
+                    return
             
             st.success(f"Processed {len(valid_chunks)} text chunks from {filename} with LangChain")
             
