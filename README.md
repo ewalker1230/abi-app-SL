@@ -1,5 +1,7 @@
 ## ABI — Agentic Business Intelligence
 
+Built as a solution for Hatch-a-thon 2025. 
+
 A lightweight Streamlit app to explore your data with natural‑language questions. Upload files, index them locally with Chroma, and ask questions to get concise answers and simple charts.
 
 ### What it does
